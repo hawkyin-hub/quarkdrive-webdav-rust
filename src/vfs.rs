@@ -24,7 +24,9 @@ use bytes::BufMut;
 
 use md5::Context as Md5Context;
 use sha1::Sha1;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 use sha1::Digest;
 use tokio::fs::File;
@@ -32,11 +34,21 @@ use tokio::fs::File;
 use crate::drive::model::{Callback, UpAuthAndCommitRequest, UpPartMethodRequest};
 use tokio::io::AsyncReadExt;
 
+#[derive(Clone, Debug)]
+pub struct ActiveWriteInfo {
+    pub file_name: String,
+    pub size: u64,
+    pub updated_at: u64,
+    pub body: Vec<u8>,
+    pub created_at: std::time::Instant,
+}
+
 #[derive(Clone)]
 pub struct QuarkDriveFileSystem {
     pub(crate) drive: QuarkDrive,
     pub(crate) dir_cache: Cache,
-    uploading: Arc<DashMap<String, Vec<QuarkFile>>>,
+    pub(crate) uploading: Arc<DashMap<String, Vec<QuarkFile>>>,
+    pub(crate) active_writes: Arc<DashMap<String, ActiveWriteInfo>>,
     pub(crate) root: PathBuf,
     no_trash: bool,
     read_only: bool,
@@ -44,9 +56,66 @@ pub struct QuarkDriveFileSystem {
     skip_upload_same_size: bool,
     prefer_http_download: bool,
     upload_wait_timeout: u64,
+    /// Filesystem-wide monotonic counter for unique temp-file names.
+    /// Pinned in atomic so concurrent calls to `prepare_for_upload` produce
+    /// strictly distinct paths even when the wall-clock ms collides
+    /// (fixes C1: temp_file_path ms-collision under concurrent PUTs).
+    temp_seq: Arc<AtomicU64>,
+    /// Per-path async mutex registry. Each value is an `AsyncMutex<()>` that
+    /// is created lazily the first time a write to that path arrives; each
+    /// subsequent PUT waits on it before doing any destructive preflight
+    /// (`remove_file` of the old fid) so concurrent PUTs to the same path
+    /// are serialized end-to-end (fixes C2: same-fid `remove_file` race).
+    write_locks: Arc<DashMap<PathBuf, Arc<AsyncMutex<()>>>>,
 }
 
 impl QuarkDriveFileSystem {
+    pub async fn register_active_write(&self, parent_path: &str, file_name: &str, size: u64, temp_file_path: &str) {
+        // 清理超过 45 秒的过期记录
+        self.active_writes.retain(|_, v| v.created_at.elapsed().as_secs() < 45);
+
+        if size > 16 * 1024 * 1024 {
+            return;
+        }
+        let body = if size == 0 {
+            Vec::new()
+        } else {
+            // Under concurrent same-path PUTs (write-coalescing), the previous
+            // writer's temp file may have already been `remove_file`'d by the
+            // time later writers reach this point. That is expected and not an
+            // error — those later writers are simply racing ahead of us, and
+            // the cloud-side file they produced will become the truth. So we
+            // down-grade "missing temp file" from `error!` to `debug!` and
+            // still register an empty-body entry — the directory listing and
+            // `metadata()` fallbacks will continue to surface the path so the
+            // Finder/proxy doesn't see a ghost 404.
+            match tokio::fs::read(temp_file_path).await {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!("register_active_write: 临时文件 {} 已被并发清理，跳过 body 缓存（无错）", temp_file_path);
+                    Vec::new()
+                }
+                Err(e) => {
+                    debug!("register_active_write: 读取临时文件 {} 失败: {:?}（降级为空 body 注册）", temp_file_path, e);
+                    Vec::new()
+                }
+            }
+        };
+        let utc_time = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => 0,
+        };
+        let info = ActiveWriteInfo {
+            file_name: file_name.to_string(),
+            size,
+            updated_at: utc_time,
+            body,
+            created_at: std::time::Instant::now(),
+        };
+        let key = format!("{}/{}", parent_path.trim_end_matches('/'), file_name);
+        self.active_writes.insert(key, info);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(drive: QuarkDrive, root: String, cache_size: u64, cache_ttl: u64) -> Result<Self> {
         let dir_cache = Cache::new(cache_size, cache_ttl, drive.clone());
@@ -60,6 +129,7 @@ impl QuarkDriveFileSystem {
             drive,
             dir_cache,
             uploading: Arc::new(DashMap::new()),
+            active_writes: Arc::new(DashMap::new()),
             root,
             no_trash: false,
             read_only: false,
@@ -67,7 +137,28 @@ impl QuarkDriveFileSystem {
             skip_upload_same_size: false,
             prefer_http_download: false,
             upload_wait_timeout: 280,
+            temp_seq: Arc::new(AtomicU64::new(0)),
+            write_locks: Arc::new(DashMap::new()),
         })
+    }
+
+    /// Resolve (and lazily create) the per-path write mutex.
+    /// All writers that touch this exact path will queue on the same
+    /// `AsyncMutex<()>` instance end-to-end. Returning the mutex by
+    /// `Arc::clone` instead of holding the DashMap guard means the guard
+    /// is dropped before the caller awaits `.lock().await`, avoiding the
+    /// "lock held across await while holding sharded entry" footgun.
+    pub(crate) fn write_lock_for(&self, path: PathBuf) -> Arc<AsyncMutex<()>> {
+        if let Some(m) = self.write_locks.get(&path) {
+            return m.value().clone();
+        }
+        let new_lock = Arc::new(AsyncMutex::new(()));
+        // Race-safe insert: if someone else won the race we drop ours
+        // and return the winning entry.
+        self.write_locks
+            .entry(path)
+            .or_insert(new_lock.clone())
+            .clone()
     }
 
     pub fn set_read_only(&mut self, read_only: bool) -> &mut Self {
@@ -213,7 +304,40 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     sha1 = Some(sha1_val);
                 }
             }
-            let mut dav_file = if let Some(file) = self.get_file(path.clone()).await? {
+            let mut file_opt = self.get_file(path.clone()).await.unwrap_or(None);
+            if file_opt.is_none() {
+                // 尝试从 active_writes 获取 (自愈)
+                let path_str = path.to_string_lossy().to_string();
+                if let Some(active_write) = self.active_writes.get(&path_str) {
+                    if active_write.created_at.elapsed().as_secs() < 45 {
+                        let now = active_write.updated_at * 1000;
+                        file_opt = Some(QuarkFile {
+                            fid: "".to_string(),
+                            file_name: active_write.file_name.clone(),
+                            pdir_fid: parent_file.fid.clone(),
+                            size: active_write.size,
+                            format_type: "application/octet-stream".to_string(),
+                            status: 1,
+                            dir: false,
+                            file: true,
+                            content_hash: None,
+                            created_at: now,
+                            updated_at: now,
+                            download_url: None,
+                            parent_path: Some(parent_path.to_string_lossy().into_owned()),
+                        });
+                    }
+                }
+            }
+            if file_opt.is_none() {
+                // 尝试从正在上传的列表中匹配 (上传占位匹配，要求文件名完全相同)
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                file_opt = self.list_uploading_files(&parent_path.to_string_lossy())
+                    .into_iter()
+                    .find(|x| x.file_name == file_name);
+            }
+
+            let mut dav_file = if let Some(file) = file_opt {
                 if options.write && options.create_new {
                     return Err(FsError::Exists);
                 }
@@ -293,20 +417,64 @@ impl DavFileSystem for QuarkDriveFileSystem {
         async move {
             let files = self.dir_cache.get_or_insert(&path.to_string_lossy())
                 .await
-                .ok_or(FsError::NotFound)
-                .and_then(|files| {
-                    Ok(files)
-                })?;
+                .ok_or(FsError::NotFound)?;
 
-            // 创建包含结果的向量
-            let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> = Vec::with_capacity(files.len());
+            let path_str = path.to_string_lossy().to_string();
+            let norm_path = path_str.trim_end_matches('/');
 
-            // 将每个文件转换为 trait 对象
-            for file in files {
-                v.push(Ok(Box::new(file))); // 现在类型匹配了
+            // 1. 提取 active_writes 中属于当前目录的项
+            let mut active_files = Vec::new();
+            for entry in self.active_writes.iter() {
+                let key = entry.key();
+                let info = entry.value();
+                if info.created_at.elapsed().as_secs() >= 45 {
+                    continue;
+                }
+                let k_path = Path::new(key);
+                if let Some(k_parent) = k_path.parent() {
+                    let k_parent_str = k_parent.to_string_lossy().to_string();
+                    let k_parent_norm = k_parent_str.trim_end_matches('/');
+                    if k_parent_norm == norm_path {
+                        let now = info.updated_at * 1000;
+                        active_files.push(QuarkFile {
+                            fid: "".to_string(),
+                            file_name: info.file_name.clone(),
+                            pdir_fid: "".to_string(),
+                            size: info.size,
+                            format_type: "application/octet-stream".to_string(),
+                            status: 1,
+                            dir: false,
+                            file: true,
+                            content_hash: None,
+                            created_at: now,
+                            updated_at: now,
+                            download_url: None,
+                            parent_path: Some(path_str.clone()),
+                        });
+                    }
+                }
             }
 
-            // 创建流并装箱
+            // 2. 提取正在上传的文件
+            let uploading_files = self.list_uploading_files(&path_str);
+
+            // 3. 去重与覆盖合并
+            let mut merged_files = std::collections::HashMap::new();
+            for file in files {
+                merged_files.insert(file.file_name.clone(), file);
+            }
+            for file in active_files {
+                merged_files.insert(file.file_name.clone(), file);
+            }
+            for file in uploading_files {
+                merged_files.insert(file.file_name.clone(), file);
+            }
+
+            let mut v: Vec<Result<Box<dyn DavDirEntry>, FsError>> = Vec::with_capacity(merged_files.len());
+            for (_, file) in merged_files {
+                v.push(Ok(Box::new(file)));
+            }
+
             let stream = futures_util::stream::iter(v);
             Ok(Box::pin(stream) as FsStream<Box<dyn DavDirEntry>>)
         }
@@ -329,13 +497,42 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Ok(Box::new(root_file) as Box<dyn DavMetaData>);
             }
 
-            // if not found in cache, get from uploading files: self.fs.uploading
+            // 1. 尝试从 cache/云端获取
             let mut file = self.get_file(path.clone()).await.unwrap_or_else(|_| Option::None);
+            
+            // 2. 尝试从 active_writes 获取 (自愈)
+            if file.is_none() {
+                let path_str = path.to_string_lossy().to_string();
+                if let Some(active_write) = self.active_writes.get(&path_str) {
+                    if active_write.created_at.elapsed().as_secs() < 45 {
+                        let parent_path = path.parent().ok_or(FsError::NotFound)?;
+                        let now = active_write.updated_at * 1000;
+                        file = Some(QuarkFile {
+                            fid: "".to_string(),
+                            file_name: active_write.file_name.clone(),
+                            pdir_fid: "".to_string(),
+                            size: active_write.size,
+                            format_type: "application/octet-stream".to_string(),
+                            status: 1,
+                            dir: false,
+                            file: true,
+                            content_hash: None,
+                            created_at: now,
+                            updated_at: now,
+                            download_url: None,
+                            parent_path: Some(parent_path.to_string_lossy().into_owned()),
+                        });
+                    }
+                }
+            }
+
+            // 3. 尝试从正在上传的列表中匹配 (上传占位匹配，要求文件名完全相同)
             if file.is_none() {
                 let parent_path = path.parent().ok_or(FsError::NotFound)?;
-                file = self.list_uploading_files(parent_path.to_str().unwrap())
-                    .first().cloned();
-
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                file = self.list_uploading_files(&parent_path.to_string_lossy())
+                    .into_iter()
+                    .find(|x| x.file_name == file_name);
             };
 
             let file = file.ok_or(FsError::NotFound)?;
@@ -692,11 +889,19 @@ impl QuarkDavFile {
         }
         if !self.upload_state.is_uploading {
             self.upload_state.is_uploading = true;
+            // Combine wall-clock ms with a filesystem-wide atomic counter so
+            // two concurrent PUTs that arrive in the same millisecond cannot
+            // produce the same temp path. AtomicU64::fetch_add is the only
+            // ordering that survives across await cancellations.
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis();
-            self.upload_state.temp_file_path = format!("/tmp/{}_{}", timestamp, self.file.file_name);
+            let seq = self.fs.temp_seq.fetch_add(1, Ordering::Relaxed);
+            self.upload_state.temp_file_path = format!(
+                "/tmp/{}_{}_{}",
+                timestamp, seq, self.file.file_name
+            );
         }
         Ok(true)
     }
@@ -759,6 +964,7 @@ impl QuarkDavFile {
             // 秒传
             self.upload_state.is_finished = true;
             self.after_flush().await?;
+            self.fs.register_active_write(&self.file.parent_path.as_ref().unwrap(), &self.file.file_name, self.upload_state.size, &self.upload_state.temp_file_path).await;
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -797,6 +1003,7 @@ impl QuarkDavFile {
         if res.data.finish {
             self.upload_state.is_finished = true;
             self.after_flush().await?;
+            self.fs.register_active_write(&self.file.parent_path.as_ref().unwrap(), &self.file.file_name, self.upload_state.size, &self.upload_state.temp_file_path).await;
             return Ok(());
         }
         // Spawn upload task so it won't be cancelled if client disconnects.
@@ -866,8 +1073,12 @@ impl QuarkDavFile {
                     error!(file_name = %file_name, error = %err, "upload chunk failed");
                     FsError::GeneralFailure
                 })?;
-                let etag_from_up_part = res.unwrap();
+                let etag_from_up_part = res.ok_or_else(|| {
+                    error!(file_name = %file_name, "up_part returned None");
+                    FsError::GeneralFailure
+                })?;
                 if etag_from_up_part == "finish" {
+                    fs.register_active_write(&parent_path, &file_name, upload_state.size, temp_path).await;
                     // cleanup
                     if tokio::fs::metadata(temp_path).await.is_ok() {
                         let _ = tokio::fs::remove_file(temp_path).await;
@@ -881,7 +1092,10 @@ impl QuarkDavFile {
             }
 
             // commit
-            let callback = upload_state.callback.clone().unwrap();
+            let callback = upload_state.callback.clone().ok_or_else(|| {
+                error!(file_name = %file_name, "upload_state.callback is None");
+                FsError::GeneralFailure
+            })?;
             let commit_req = UpAuthAndCommitRequest {
                 md5s: etags,
                 callback,
@@ -901,6 +1115,7 @@ impl QuarkDavFile {
                 FsError::GeneralFailure
             })?;
 
+            fs.register_active_write(&parent_path, &file_name, upload_state.size, temp_path).await;
             // cleanup
             if tokio::fs::metadata(temp_path).await.is_ok() {
                 let _ = tokio::fs::remove_file(temp_path).await;
@@ -991,6 +1206,7 @@ impl QuarkDavFile {
             // 秒传
             self.upload_state.is_finished = true;
             self.after_flush().await?;
+            self.fs.register_active_write(&self.file.parent_path.as_ref().unwrap(), &self.file.file_name, self.upload_state.size, &self.upload_state.temp_file_path).await;
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -1034,9 +1250,13 @@ impl QuarkDavFile {
         }
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis();
-        self.upload_state.temp_file_path = format!("./temp/{}_{}", timestamp, self.file.file_name);
+        let seq = self.fs.temp_seq.fetch_add(1, Ordering::Relaxed);
+        self.upload_state.temp_file_path = format!(
+            "./temp/{}_{}_{}",
+            timestamp, seq, self.file.file_name
+        );
 
         // 创建一个空白文件txt
         let empty_file_content = b"";
@@ -1171,7 +1391,10 @@ impl QuarkDavFile {
                 error!(file_name = %self.file.file_name, error = %err, "upload chunk failed");
                 FsError::GeneralFailure
             })?;
-            let etag_from_up_part = res.unwrap();
+            let etag_from_up_part = res.ok_or_else(|| {
+                error!(file_name = %self.file.file_name, "up_part returned None");
+                FsError::GeneralFailure
+            })?;
             // 检查是否提前完成
             if etag_from_up_part == "finish" {
                 return Ok(());
@@ -1179,7 +1402,10 @@ impl QuarkDavFile {
             etags[(chunk_idx - 1) as usize] = etag_from_up_part;
             // self.upload_state.chunk += 1;
         }
-        let callback = self.upload_state.callback.clone().unwrap();
+        let callback = self.upload_state.callback.clone().ok_or_else(|| {
+            error!(file_name = %self.file.file_name, "upload_state.callback is None");
+            FsError::GeneralFailure
+        })?;
 
         let auth_info = &self.upload_state.auth_info;
         let commit_req = UpAuthAndCommitRequest{
@@ -1252,7 +1478,10 @@ impl DavFile for QuarkDavFile {
             if self.file.fid.is_empty() {
                 return Err(FsError::NotFound);
             }
-            let download_url = self.fs.drive.get_download_url(&self.file.fid).await.unwrap();
+            let download_url = self.fs.drive.get_download_url(&self.file.fid).await.map_err(|e| {
+                error!(file_name = %self.file.file_name, error = ?e, "get_download_url for redirect failed");
+                FsError::GeneralFailure
+            })?;
 
             return Ok(Some(download_url));
 
@@ -1311,6 +1540,27 @@ impl DavFile for QuarkDavFile {
         );
         async move {
             if self.file.fid.is_empty() {
+                // 1. 尝试自愈：如果在 active_writes 里有记录，返回内存缓存数据
+                let full_path = self.parent_dir.join(&self.file.file_name);
+                let path_str = full_path.to_string_lossy().to_string();
+                if let Some(info) = self.fs.active_writes.get(&path_str) {
+                    if info.created_at.elapsed().as_secs() < 45 {
+                        let start = self.current_pos as usize;
+                        if start >= info.body.len() {
+                            return Ok(Bytes::new());
+                        }
+                        let end = std::cmp::min(start + count, info.body.len());
+                        let bytes = Bytes::copy_from_slice(&info.body[start..end]);
+                        self.current_pos = end as u64;
+                        return Ok(bytes);
+                    }
+                }
+
+                // 2. 嗅探占位防御：正在上传且大小为0
+                if self.file.size == 0 {
+                    return Ok(Bytes::new());
+                }
+
                 // upload in progress
                 return Err(FsError::NotFound);
             }
@@ -1320,7 +1570,10 @@ impl DavFile for QuarkDavFile {
                 .unwrap_or(false);
 
             if !is_valid {
-                let new_url = self.get_download_url().await.unwrap();
+                let new_url = self.get_download_url().await.map_err(|e| {
+                    error!(file_name = %self.file.file_name, error = ?e, "get_download_url failed");
+                    FsError::GeneralFailure
+                })?;
                 self.file.download_url = Some(new_url);
             }
             let download_url = match self.file.download_url.as_ref() {
@@ -1336,7 +1589,10 @@ impl DavFile for QuarkDavFile {
             };
 
             if !download_url.is_empty() {
-                let content = self.fs.drive.download(download_url, Some((self.current_pos, count))).await.unwrap();
+                let content = self.fs.drive.download(download_url.clone(), Some((self.current_pos, count))).await.map_err(|err| {
+                    error!(file_name = %self.file.file_name, error = %err, "download chunk failed");
+                    FsError::GeneralFailure
+                })?;
                 self.current_pos += content.len() as u64;
                 return Ok(content);
             }else {
@@ -1348,6 +1604,13 @@ impl DavFile for QuarkDavFile {
 
     fn flush(&mut self) -> FsFuture<()> {
         debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: flush");
+        // Compute the full dav path *before* moving into the async block, so
+        // we don't have to borrow `self.parent_dir`/`self.file.file_name`
+        // across an await while the same `&mut self` is already mutably
+        // borrowed.
+        let full_path = self.parent_dir.join(&self.file.file_name);
+        let write_lock = self.fs.write_lock_for(full_path);
+        let fs_for_errpath = self.fs.clone();
         async move {
             // if self.upload_state.flush_count >=1 {
             //     // maybe zero byte file, try to upload again
@@ -1368,10 +1631,17 @@ impl DavFile for QuarkDavFile {
                 debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: flush - already finished");
                 return Ok(());
             }
+
+            // Serialize concurrent same-path PUTs end-to-end (agent.md §2.1
+            // "路径独占重入写锁"). The lock is keyed by the full dav path
+            // so unrelated files don't queue on the same mutex.
+            let _guard = write_lock.lock().await;
             let res = self.do_flush().await;
+            drop(_guard);
             if let Err(err) = res {
                 error!(file_id = %self.file.fid, file_name = %self.file.file_name, error = %err, "file: flush failed");
                 self.after_flush().await?;
+                let _ = fs_for_errpath;
                 return Err(err);
             }
             Ok(())

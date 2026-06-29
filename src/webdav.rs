@@ -13,9 +13,31 @@ use hyper_util::{
     server::conn::auto,
 };
 use tokio::net::TcpListener;
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{debug, error, info};
 
 use crate::vfs::QuarkDriveFileSystem;
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(certs)
+}
+
+fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let key = rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {:?}", path))?;
+    Ok(key)
+}
 
 pub struct WebDavServer {
     pub host: String,
@@ -43,13 +65,33 @@ impl WebDavServer {
             strip_prefix: self.strip_prefix.clone(),
         };
 
+        // 初始化 TLS 接收器
+        let tls_acceptor = if let Some((cert_path, key_path)) = self.tls_config {
+            // 显式安装默认 Ring 密码提供者，防止 runtime panic
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
+            let certs = load_certs(&cert_path)?;
+            let key = load_key(&key_path)?;
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| anyhow::anyhow!("failed to create rustls server config: {}", e))?;
+            Some(TlsAcceptor::from(Arc::new(server_config)))
+        } else {
+            None
+        };
+
         let listener = TcpListener::bind(&addr).await?;
-        info!("listening on http://{}", listener.local_addr()?);
+        if tls_acceptor.is_some() {
+            info!("listening on https://{}", listener.local_addr()?);
+        } else {
+            info!("listening on http://{}", listener.local_addr()?);
+        }
 
         loop {
             let (tcp, _) = listener.accept().await?;
-            let io = TokioIo::new(tcp);
             let make_svc = make_svc.clone();
+            let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
                 let service = match make_svc.call(()).await {
@@ -57,16 +99,35 @@ impl WebDavServer {
                     Err(_) => return,
                 };
 
-                if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await
-                {
-                    error!("HTTP serve error: {}", e);
+                if let Some(acceptor) = tls_acceptor {
+                    match acceptor.accept(tcp).await {
+                        Ok(tls_stream) => {
+                            let io = TokioIo::new(tls_stream);
+                            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                error!("HTTPS serve error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("TLS handshake accept error: {}", e);
+                        }
+                    }
+                } else {
+                    let io = TokioIo::new(tcp);
+                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        error!("HTTP serve error: {}", e);
+                    }
                 }
             });
         }
 
         // 循环会持续运行，实际不会到达这里
+        #[allow(unreachable_code)]
         Ok(())
     }
 }
@@ -784,6 +845,101 @@ mod tests {
         assert!(should_add_digest(&Some("MD5;q=1, SHA-256".to_string())));
         assert!(!should_add_digest(&Some("sha-256".to_string())));
         assert!(!should_add_digest(&Some("sha-512".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_webdav_server_tls_handshake() {
+        use std::sync::Arc;
+        use dashmap::DashMap;
+
+        // 1. 生成临时自签名证书和私钥
+        let cert_path = std::env::temp_dir().join("test_cert.pem");
+        let key_path = std::env::temp_dir().join("test_key.pem");
+
+        let status = std::process::Command::new("openssl")
+            .args(&[
+                "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", key_path.to_str().unwrap(),
+                "-out", cert_path.to_str().unwrap(),
+                "-sha256", "-days", "1", "-nodes",
+                "-subj", "/CN=localhost"
+            ])
+            .status()
+            .expect("failed to execute openssl");
+        assert!(status.success(), "openssl command failed");
+
+        // 2. 初始化 mock 挂载所需文件系统和处理器
+        let cookie = Arc::new(DashMap::new());
+        cookie.insert("test".to_string(), "value".to_string());
+        let config = crate::drive::DriveConfig {
+            api_base_url: "https://drive.quark.cn".to_string(),
+            cookie,
+        };
+        let drive = crate::drive::QuarkDrive::new(config).unwrap();
+        let fs = crate::vfs::QuarkDriveFileSystem::new(drive, "/".to_string(), 10, 60).unwrap();
+        let handler = DavHandler::builder()
+            .filesystem(Box::new(fs.clone()))
+            .build_handler();
+
+        // 3. 构建 WebDavServer
+        let port = 18443;
+        let server = WebDavServer {
+            host: "127.0.0.1".to_string(),
+            port,
+            auth_user: None,
+            auth_password: None,
+            tls_config: Some((cert_path.clone(), key_path.clone())),
+            handler,
+            fs,
+            strip_prefix: None,
+        };
+
+        // 4. 在后台运行 Server
+        let handle = tokio::spawn(async move {
+            if let Err(e) = server.serve().await {
+                eprintln!("Server error in test: {:?}", e);
+            }
+        });
+
+        // 给时间让端口监听就绪
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // 5. 使用 reqwest 发送 HTTPS 请求
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client.get(&format!("https://127.0.0.1:{}", port))
+            .send()
+            .await;
+
+        // 6. 清理临时证书文件
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(key_path);
+
+        // 7. 验证请求是否成功 (因为自签名证书握手通过，即使由于 Mock 没有真实网盘数据，请求能发送并收到 HTTP 响应即说明 TLS 握手通过)
+        match res {
+            Ok(resp) => {
+                let status = resp.status();
+                // 哪怕返回了 401, 404 或 500，说明 TLS 连接成功并且 Hyper 处理了请求
+                assert!(
+                    status.is_success()
+                        || status == hyper::StatusCode::UNAUTHORIZED
+                        || status == hyper::StatusCode::NOT_FOUND
+                        || status == hyper::StatusCode::METHOD_NOT_ALLOWED
+                        || status == hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Expected success, 401, 404, 405 or 500, but got status: {}",
+                    status
+                );
+            }
+            Err(e) => {
+                panic!("HTTPS request failed to connect or handshake: {:?}", e);
+            }
+        }
+
+        // 终止服务
+        handle.abort();
     }
 }
 

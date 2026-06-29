@@ -189,6 +189,11 @@ async fn main() -> anyhow::Result<()> {
         .set_skip_upload_same_size(opt.skip_upload_same_size)
         .set_prefer_http_download(opt.prefer_http_download)
         .set_upload_wait_timeout(opt.upload_wait_timeout);
+    // §1.3 冷启动清空 dir_cache:对齐 Python DiskCache 单例首次创建时
+    // rmtree + mkdir 的语义;moka 是 in-memory LRU,所以 "truncate 磁盘 JSON"
+    // 无对应物,仅 invalidate_all 即可。
+    fs.dir_cache.invalidate_all();
+    debug!("dir_cache cold-cleared on startup (agent.md §1.3)");
     let cache = Arc::new(fs.dir_cache.clone());
     start_periodic_invalidate(cache.clone(), opt.refresh_cache_secs_interval);
     let fs_for_browser = fs.clone();

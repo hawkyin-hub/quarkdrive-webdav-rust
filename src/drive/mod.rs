@@ -807,8 +807,13 @@ impl QuarkDrive {
                 if res.status() == StatusCode::NO_CONTENT {
                     return Ok(None);
                 }
-                let etag = res.headers().get("Etag").unwrap().to_str().unwrap();
-                return Ok(Some(etag.to_string()));
+                // §3.2 Future 链禁 unwrap:OSS 不返 Etag 头时降级为 None,不 panic
+                let etag = res
+                    .headers()
+                    .get("Etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                Ok(etag)
             }
             Err(err) => {
                 let err_msg = res.text().await?;
@@ -834,8 +839,13 @@ impl QuarkDrive {
                         if res.status() == StatusCode::NO_CONTENT {
                             return Ok(None);
                         }
-                        let etag = res.headers().get("Etag").unwrap().to_str().unwrap();
-                        Ok(Some(etag.to_string()))
+                        // §3.2 同上:重试分支也不 unwrap
+                        let etag = res
+                            .headers()
+                            .get("Etag")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        Ok(etag)
                     }
                     // unexpected error
                     _ => {

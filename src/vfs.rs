@@ -67,6 +67,11 @@ pub struct QuarkDriveFileSystem {
     /// (`remove_file` of the old fid) so concurrent PUTs to the same path
     /// are serialized end-to-end (fixes C2: same-fid `remove_file` race).
     write_locks: Arc<DashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    /// §2.2 Write Folding generation counter. Each `prepare_for_upload` bumps
+    /// the counter for its path; `flush()` checks the counter *after* acquiring
+    /// the write lock — if a newer generation exists the stale upload is
+    /// skipped (temp file deleted, no network traffic wasted).
+    upload_generation: Arc<DashMap<PathBuf, u64>>,
 }
 
 impl QuarkDriveFileSystem {
@@ -139,6 +144,7 @@ impl QuarkDriveFileSystem {
             upload_wait_timeout: 280,
             temp_seq: Arc::new(AtomicU64::new(0)),
             write_locks: Arc::new(DashMap::new()),
+            upload_generation: Arc::new(DashMap::new()),
         })
     }
 
@@ -805,7 +811,10 @@ struct UploadState {
     callback: Option<Callback>,
     is_uploading: bool,
     flush_count: u32,
-
+    /// §2.2 Write Folding generation counter — monotonically increasing per
+    /// dav path; `flush()` checks after acquiring the write lock and skips
+    /// the upload when a newer generation has arrived while it waited.
+    generation: u64,
 }
 
 impl Default for UploadState {
@@ -829,6 +838,7 @@ impl Default for UploadState {
             callback: None,
             is_uploading: false,
             flush_count: 0,
+            generation: 0,
         }
     }
 }
@@ -889,6 +899,15 @@ impl QuarkDavFile {
         }
         if !self.upload_state.is_uploading {
             self.upload_state.is_uploading = true;
+            // §2.2 Write Folding: bump per-path generation counter and record
+            // our generation so flush() can detect if a newer PUT arrived while
+            // we waited on the write lock.
+            let dav_path = self.parent_dir.join(&self.file.file_name);
+            let upload_gen = self.fs.upload_generation
+                .entry(dav_path)
+                .and_modify(|g| *g += 1)
+                .or_insert(1);
+            self.upload_state.generation = *upload_gen;
             // Combine wall-clock ms with a filesystem-wide atomic counter so
             // two concurrent PUTs that arrive in the same millisecond cannot
             // produce the same temp path. AtomicU64::fetch_add is the only
@@ -1609,6 +1628,7 @@ impl DavFile for QuarkDavFile {
         // across an await while the same `&mut self` is already mutably
         // borrowed.
         let full_path = self.parent_dir.join(&self.file.file_name);
+        let full_path_for_gen = full_path.clone();  // §2.2: clone before write_lock_for consumes it
         let write_lock = self.fs.write_lock_for(full_path);
         let fs_for_errpath = self.fs.clone();
         async move {
@@ -1636,6 +1656,30 @@ impl DavFile for QuarkDavFile {
             // "路径独占重入写锁"). The lock is keyed by the full dav path
             // so unrelated files don't queue on the same mutex.
             let _guard = write_lock.lock().await;
+
+            // §2.2 Write Folding: if a newer PUT for the same path has been
+            // queued while we waited, our upload is obsolete — skip the
+            // network round-trip and just clean up the local temp file.
+            if let Some(current_gen) = self.fs.upload_generation.get(&full_path_for_gen) {
+                if *current_gen > self.upload_state.generation {
+                    debug!(
+                        generation = self.upload_state.generation,
+                        current_generation = *current_gen,
+                        file_name = %self.file.file_name,
+                        "§2.2 write folding: obsolete upload, skipping"
+                    );
+                    let _ = self.delete_temp_file().await;
+                    // Remove from uploading list so it doesn't stale the directory listing
+                    let parent_path = self.file.parent_path.as_ref()
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    self.fs.remove_uploading_file(parent_path, &self.file.file_name);
+                    self.upload_state.is_finished = true;
+                    drop(_guard);
+                    return Ok(());
+                }
+            }
+
             let res = self.do_flush().await;
             drop(_guard);
             if let Err(err) = res {

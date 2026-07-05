@@ -113,6 +113,8 @@ ps -o pid,rss,command -p $(pgrep -f quarkdrive-webdav)
 
 | 候选 | 预期收益 | 风险 | 前置条件 |
 |------|---------|------|---------|
+| 下载异步并发预读 (Prefetching) | 大文件连续读取延迟 -80% | 低 | 无，需要状态机检测顺序读取行为 |
+| 单分块多并发分片下载 (Parallel Download) | 单块下载吞吐 ×2~3 | 中 | 需要精细控制并发连接数以防触发 API 风控 |
 | 客户端并发分片（≥4） | 上传吞吐 ×2~3 | 中（必须先验证 API 支持） | Quark API 返回 `part_thread>1` |
 | `moka` 预热策略 | 目录列表 -30% | 低 | 已在 root 启动时做一次 PROPFIND，可推广到常用路径 |
 | `quark` 目录列表走 `if-modified-since` | 大目录 -50% | 中 | Quark API 必须支持 ETag |

@@ -1487,16 +1487,13 @@ impl DavFile for QuarkDavFile {
     fn redirect_url(&mut self) -> FsFuture<Option<String>> {
         debug!(file_id = %self.file.fid, file_name = %self.file.file_name, "file: redirect_url");
         async move {
-            if self.file.fid.is_empty() {
-                return Err(FsError::NotFound);
-            }
-            let download_url = self.fs.drive.get_download_url(&self.file.fid).await.map_err(|e| {
-                error!(file_name = %self.file.file_name, error = ?e, "get_download_url for redirect failed");
-                FsError::GeneralFailure
-            })?;
-
-            return Ok(Some(download_url));
-
+            // 修复：禁用直连 CDN 的 302 redirect。
+            // webdavfs_agent 拿到 redirect URL 后会直连 Quark CDN，绕过我们的代理，
+            // 没有任何超时控制。大文件传输途中 CDN URL 过期或 CDN 抖动时，
+            // Finder 会无限 hang 住（卡死表现）。
+            // 返回 None 强制 webdavfs 走 read_bytes() 路径，由我们的 proxy 管控，
+            // 每个 chunk 都有 30s 超时保护。
+            Ok(None)
         }
             .boxed()
     }
@@ -1601,13 +1598,24 @@ impl DavFile for QuarkDavFile {
             };
 
             if !download_url.is_empty() {
-                let content = self.fs.drive.download(download_url.clone(), Some((self.current_pos, count))).await.map_err(|err| {
+                // 修复：加 30s 超时，防止 CDN 慢连接或 stall 导致 Finder 卡死。
+                // 超时后返回 GeneralFailure，webdavfs 会重试而不是永远 hang。
+                let content = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.fs.drive.download(download_url.clone(), Some((self.current_pos, count))),
+                )
+                .await
+                .map_err(|_| {
+                    error!(file_name = %self.file.file_name, pos = self.current_pos, count = count, "download chunk timed out after 30s");
+                    FsError::GeneralFailure
+                })?
+                .map_err(|err| {
                     error!(file_name = %self.file.file_name, error = %err, "download chunk failed");
                     FsError::GeneralFailure
                 })?;
                 self.current_pos += content.len() as u64;
                 return Ok(content);
-            }else {
+            } else {
                 return Err(FsError::NotFound);
             }
         }
@@ -1704,8 +1712,9 @@ fn is_url_expired(url: &str) -> bool {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_secs();
-            // 预留 1 分钟
-            return current_ts + 60 >= expires;
+            // 修复：预留 5 分钟，大文件下载途中有足够时间刷新 URL，
+            // 避免传输中途 URL 过期导致 CDN 拒绝请求（Finder 卡死根因之一）。
+            return current_ts + 300 >= expires;
         }
     }
     false

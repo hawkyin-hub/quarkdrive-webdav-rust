@@ -103,6 +103,39 @@ rtk cargo build --release
 - `quarkdrive-webdav/src/mount.rs` — `mount_webdav -S -o url=...` 包装，macOS 版本差异敏感
 - `quarkdrive-webdav/src/proxy.rs` — HTTPS 终结代理，`mount_webdav` 强依赖
 
+## 长期记录（每个项目一个）
+
+| 文件 | 用途 | 触发时机 |
+|------|------|---------|
+| `bug修复经验.md`（位于项目根） | 每次 bug 修复的真实经验 | 用户**已确认**修复成功后立即追加 |
+
+### `bug修复经验.md` 写法要求
+
+每条修复记录采用「**现象 → 根因 → 改动 → 验证 → 经验**」五段式，不写完不许划上 complete。
+每条要保留：用户原话 / 日志片段 / 关键行号 / 复现命令，确保下次同症可直接命中。
+
+未确认的修复**不许**写入，因为可能引入误导。
+
+## 测试快捷脚本
+
+任何源码改动（性能优化、bug fix、协议层调整）后，跑一次端到端部署验证：
+
+```bash
+./scripts/build_deploy_test.sh
+```
+
+该脚本一次性完成：
+
+1. `cargo build --release`（活跃 crate 是 `quarkdrive-webdav/`）
+2. `scripts/build-app.sh` 打包成 `.app`
+3. 杀掉旧 `quarkdrive-webdav` / `run-localquark.sh` 并 `diskutil unmount force /Volumes/LocalQuark`
+4. 安装到 `/Applications/LocalQuark-rust.app`
+5. `open -a LocalQuark-rust` 重启
+6. 轮询 `mount` 状态直到 `/Volumes/LocalQuark` 出现，最长等 30s
+
+> **规则**：所有"测试用"的重复命令（编译→打包→安装→杀进程→启动→验证）一律放进 sh 脚本里，
+> 不要再逐步手动执行。每个阶段之间保留 `sleep`，让 mount/proxy 有时间稳定。
+
 ## 关键设计决策（不要随意推翻）
 
 1. **HTTPS 终结代理**：macOS 26.6 的 `webdavfs_agent` 拒绝 HTTP + Basic Auth（`Authentication method (Basic) too weak`），所以 daemon 内部架构必须是 `backend (HTTP 8080) → proxy (HTTPS 8443) → mount_webdav`。详见 `docs/DEPLOYMENT.md` 与 `ARCHITECTURE.md`。
@@ -134,3 +167,23 @@ rtk cargo build --release
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | 性能基线 / 可复现测试 / Phase 真实状态 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 排错手册 |
 | [docs/archive/rust-migration.md](docs/archive/rust-migration.md) | 历史设计草案（仅参考） |
+
+## 重复命令固化（脚本清单）
+
+按用户规则"测试相关的重复命令全部先变成 sh 文件"，已沉淀：
+
+| 脚本 | 用途 | 是否重新编译 |
+|------|------|--------------|
+| `scripts/build-app.sh` | 单 `.app` 打包（产物 `dist/LocalQuark-rust.app`） | 否（依赖已编译的 `target/release/quarkdrive-webdav`） |
+| `scripts/build_deploy_test.sh` | 编译 → 打包 → 装到 /Applications → 启动 → 等挂载（代码改动后用） | **是** |
+| `scripts/restart_app.sh` | 杀掉旧服务 → 同步最新 cookie → 启动 .app → 验证 PROPFIND（cookie 过期时用） | 否 |
+
+**何时跑哪个**：
+- 改了 Rust 代码 → `scripts/build_deploy_test.sh`
+- cookie 过期导致网盘加载失败 → `scripts/restart_app.sh`
+- 想重新打 .app 但不装到系统 → `scripts/build-app.sh`
+
+## 新增规则（由用户纠正沉淀）
+
+1. **复杂 Bug 严禁高频猜测性试错**：针对多并发穿透、协议死锁、系统句柄冲突等疑难杂症，必须首先全面静态审查已知的 Python 遗留实现（尤其是 `legacy/` 目录下解码的完整代码）和环境状态。在整理出具有确定性的根因逻辑链条之前，禁止通过“发现一个疑似问题就运行一次编译部署”的方式盲目高频测试，避免浪费 Token 和开发时间。
+

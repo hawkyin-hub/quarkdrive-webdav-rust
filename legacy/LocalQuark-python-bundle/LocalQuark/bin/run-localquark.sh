@@ -124,11 +124,11 @@ if [ "$(uname -s)" = "Darwin" ]; then
         # than the silent IllegalURLComponent we got when user:pass was
         # in the URL.
         /usr/bin/security add-internet-password \
-            -a "$LOCALQUARK_AUTH_USER" \
+            -a "${LOCALQUARK_AUTH_USER}x" \
             -s "$LOCALQUARK_HOST" \
             -P "$LOCALQUARK_PORT" \
             -r htps \
-            -w "$LOCALQUARK_AUTH_PASSWORD" \
+            -w "${LOCALQUARK_AUTH_PASSWORD}x" \
             -A \
             ~/Library/Keychains/login.keychain-db \
             2>>"$LOCALQUARK_LOG_FILE" || true
@@ -183,7 +183,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
                     "$UID_VAL" "$GID_VAL" \
                     2>>"$LOCALQUARK_LOG_FILE"; then
                 log "mkdir and chmod ok; mounting via user mount_webdav"
-                if mount_webdav -s "$URL" "$LOCALQUARK_MOUNT_POINT" \
+                if mount_webdav -s -v LocalQuark "$URL" "$LOCALQUARK_MOUNT_POINT" \
                         2>>"$LOCALQUARK_LOG_FILE"; then
                     log "mount ok (via user mount_webdav)"
                 else
@@ -206,7 +206,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
         # non-fatal.
         log "helper not installed; mounting via direct mount_webdav (best-effort)"
         if mkdir -p "$LOCALQUARK_MOUNT_POINT" 2>/dev/null; then
-            if mount_webdav -s "$URL" "$LOCALQUARK_MOUNT_POINT" \
+            if mount_webdav -s -v LocalQuark "$URL" "$LOCALQUARK_MOUNT_POINT" \
                     2>>"$LOCALQUARK_LOG_FILE"; then
                 log "mount ok"
             else

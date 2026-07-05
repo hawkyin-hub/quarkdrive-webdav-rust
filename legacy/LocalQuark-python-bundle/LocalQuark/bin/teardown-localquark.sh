@@ -9,6 +9,10 @@ LOCALQUARK_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=lib-common.sh
 source "$SCRIPT_DIR/lib-common.sh"
 
+if [ "$(uname -s)" = "Darwin" ]; then
+    osascript -e "tell application \"Finder\" to close (every window whose name is \"LocalQuark\" or POSIX path of (target of it as alias) starts with \"$LOCALQUARK_MOUNT_POINT\")" 2>/dev/null || true
+fi
+
 if [ "$(uname -s)" = "Darwin" ] && mount | grep -q " on $LOCALQUARK_MOUNT_POINT ("; then
     if helper_available; then
         log "helper detected; unmounting via helper-client"

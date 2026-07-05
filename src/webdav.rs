@@ -82,6 +82,7 @@ impl WebDavServer {
         };
 
         let listener = TcpListener::bind(&addr).await?;
+        eprintln!("[backend] bound to {} (tls={})", listener.local_addr()?, tls_acceptor.is_some());
         if tls_acceptor.is_some() {
             info!("listening on https://{}", listener.local_addr()?);
         } else {
@@ -94,17 +95,50 @@ impl WebDavServer {
             let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
+                // E2E DEBUG: log peer address
+                let peer = tcp.peer_addr().ok();
+                info!(?peer, "connection accepted");
+
                 let service = match make_svc.call(()).await {
                     Ok(service) => service,
                     Err(_) => return,
                 };
 
-                if let Some(acceptor) = tls_acceptor {
+                if let Some(acceptor) = tls_acceptor.clone() {
                     match acceptor.accept(tcp).await {
                         Ok(tls_stream) => {
                             let io = TokioIo::new(tls_stream);
+                            // E2E DEBUG: wrap service with request logger
+                            let svc = service;
+                            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                                let method = req.method().clone();
+                                let uri = req.uri().clone();
+                                let headers: Vec<(String, String)> = req.headers().iter()
+                                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("?").to_string()))
+                                    .collect();
+                                let auth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).cloned();
+                                let ua = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).cloned();
+                                let depth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("depth")).cloned();
+                                info!(
+                                    method = %method,
+                                    uri = %uri,
+                                    user_agent = ?ua.map(|(_,v)| v),
+                                    authorization = ?auth.map(|(_,v)| v),
+                                    depth = ?depth.map(|(_,v)| v),
+                                    "INCOMING REQUEST"
+                                );
+                                let fut = svc.call(req);
+                                async move {
+                                    let resp = fut.await;
+                                    match &resp {
+                                        Ok(r) => info!(status = %r.status(), "RESPONSE"),
+                                        Err(e) => error!(error = %e, "RESPONSE ERROR"),
+                                    }
+                                    resp
+                                }
+                            });
                             if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                                .serve_connection(io, service)
+                                .serve_connection(io, svc)
                                 .await
                             {
                                 error!("HTTPS serve error: {}", e);
@@ -116,8 +150,23 @@ impl WebDavServer {
                     }
                 } else {
                     let io = TokioIo::new(tcp);
+                    let svc = service;
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let method = req.method().clone();
+                        let uri = req.uri().clone();
+                        info!(method = %method, uri = %uri, "INCOMING REQUEST (http)");
+                        let fut = svc.call(req);
+                        async move {
+                            let resp = fut.await;
+                            match &resp {
+                                Ok(r) => info!(status = %r.status(), "RESPONSE"),
+                                Err(e) => error!(error = %e, "RESPONSE ERROR"),
+                            }
+                            resp
+                        }
+                    });
                     if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(io, service)
+                        .serve_connection(io, svc)
                         .await
                     {
                         error!("HTTP serve error: {}", e);
@@ -862,7 +911,8 @@ mod tests {
                 "-keyout", key_path.to_str().unwrap(),
                 "-out", cert_path.to_str().unwrap(),
                 "-sha256", "-days", "1", "-nodes",
-                "-subj", "/CN=localhost"
+                "-subj", "/CN=localhost",
+                "-addext", "subjectAltName=DNS:localhost"
             ])
             .status()
             .expect("failed to execute openssl");

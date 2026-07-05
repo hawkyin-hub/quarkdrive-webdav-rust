@@ -1,151 +1,147 @@
+//! QuarkDrive-WebDAV 启动入口(终结代理 + 后端双进程模型)。
+//!
+//! 复刻原 Python 版 `LocalQuark` 启动流程:
+//!   1. cookie::CookieStore::from_chromium
+//!   2. 生成随机 webdav password + 落盘
+//!   3. 启动 HTTP WebDAV 后端 (127.0.0.1:8080, dav-server)
+//!   4. 启动 HTTPS 终结代理 (127.0.0.1:8443, TLS 1.2 + ALPN http/1.1)
+//!   5. 挂载前根 PROPFIND 预热 (https_proxy.py warm_root_sync)
+//!   6. 挂载点:由 helper / mount_webdav 接手
+//!   7. 12h cookie refresh + 60s health check
+//!   8. tray::run 阻塞
+//!
+//! 与原版 Python 行为一一对应:
+//!   quarkdrive-webdav (HTTP 8080) = 原 quarkdrive-webdav 二进制
+//!   proxy (HTTPS 8443)            = 原 https_proxy.py
+//!   mount_webdav                  = 原 mount_core.mount_webdav
+
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::time::Duration;
-use anyhow::bail;
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
-use dav_server::{memls::MemLs, DavHandler};
-#[cfg(unix)]
-use futures_util::stream::StreamExt;
-use tracing::{debug, info};
+use rand::RngCore;
+use tokio::sync::Notify;
+use tokio::time::interval;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+use quarkdrive_webdav::cookie::{CookieStore, DEFAULT_BROWSERS};
+use quarkdrive_webdav::drive::{DriveConfig, QuarkDrive};
+use quarkdrive_webdav::health::{self, HealthChecker};
+use quarkdrive_webdav::mount::{self, MountConfig};
+use quarkdrive_webdav::notifier;
+use quarkdrive_webdav::proxy::{self, ProxyConfig};
+use quarkdrive_webdav::tray;
+use quarkdrive_webdav::vfs::QuarkDriveFileSystem;
+use quarkdrive_webdav::webdav::WebDavServer;
+
 #[cfg(unix)]
 use {signal_hook::consts::signal::*, signal_hook_tokio::Signals};
-
-use cache::Cache;
-use drive::*;
-use vfs::QuarkDriveFileSystem;
-use webdav::WebDavServer;
-
-mod cache;
-mod drive;
-mod vfs;
-mod webdav;
-use tokio::time::interval;
+#[cfg(unix)]
+use futures_util::stream::StreamExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "quarkdrive-webdav", about, version, author)]
-#[command(args_conflicts_with_subcommands = true)]
 struct Opt {
-    /// Listen host
-    #[arg(long, env = "HOST", default_value = "0.0.0.0")]
+    /// HTTPS 终结代理监听地址(对外,即 mount_webdav 连接的目标)
+    #[arg(long, env = "HOST", default_value = "127.0.0.1")]
     host: String,
-    /// Listen port
-    #[arg(short, env = "PORT", default_value = "8080")]
+    #[arg(long, env = "PORT", default_value = "8443")]
     port: u16,
 
-    ///  drive client_secret
+    /// HTTP WebDAV 后端监听地址(仅本地)
+    #[arg(long, env = "BACKEND_HOST", default_value = "127.0.0.1")]
+    backend_host: String,
+    #[arg(long, env = "BACKEND_PORT", default_value = "8080")]
+    backend_port: u16,
+
+    /// 显式传入 cookie(分号串);不传则从浏览器抓
     #[arg(long, env = "QUARK_COOKIE")]
     quark_cookie: Option<String>,
 
-    /// WebDAV authentication username
-    #[arg(short = 'U', long, env = "WEBDAV_AUTH_USER")]
-    auth_user: Option<String>,
-    /// WebDAV authentication password
+    #[arg(short = 'U', long, env = "WEBDAV_AUTH_USER", default_value = "quasar")]
+    auth_user: String,
     #[arg(short = 'W', long, env = "WEBDAV_AUTH_PASSWORD")]
     auth_password: Option<String>,
-    /// Automatically generate index.html
-    #[arg(short = 'I', long)]
-    auto_index: bool,
-    /// Read/download buffer size in bytes, defaults to 10MB
-    #[arg(short = 'S', long, default_value = "10485760")]
-    read_buffer_size: usize,
-    /// Upload buffer size in bytes, defaults to 16MB
-    #[arg(long, default_value = "16777216")]
-    upload_buffer_size: usize,
-    /// Directory entries cache size
-    #[arg(long, default_value = "1000")]
-    cache_size: u64,
-    /// Directory entries cache expiration time in seconds
-    #[arg(long, default_value = "600")]
-    cache_ttl: u64,
-    /// Root directory path
-    #[arg(long, env = "WEBDAV_ROOT", default_value = "/")]
-    root: String,
-    /// Delete file permanently instead of trashing it
-    #[arg(long)]
-    no_trash: bool,
-    /// Enable read only mode
-    #[arg(long)]
-    read_only: bool,
-    /// TLS certificate file path
+
+    #[arg(long, default_value = "~/Mount/Quark")]
+    mount_point: String,
+
+    /// TLS 证书/私钥(强制要求;终结代理需要)
     #[arg(long, env = "TLS_CERT")]
     tls_cert: Option<PathBuf>,
-    /// TLS private key file path
     #[arg(long, env = "TLS_KEY")]
     tls_key: Option<PathBuf>,
-    /// Prefix to be stripped off when handling request.
-    #[arg(long, env = "WEBDAV_STRIP_PREFIX")]
-    strip_prefix: Option<String>,
-    /// Enable debug log
+
+    #[arg(long, default_value = "43200")]
+    cookie_refresh_secs: u64,
+    #[arg(long, default_value = "60")]
+    health_check_secs: u64,
+
     #[arg(long)]
     debug: bool,
-    /// Disable self auto upgrade
+
+    /// 仅 server 模式(不挂载、不菜单栏、不健康检查)
     #[arg(long)]
-    no_self_upgrade: bool,
-    /// Skip uploading same size file
-    #[arg(long)]
-    skip_upload_same_size: bool,
-    /// Prefer downloading using HTTP protocol
-    #[arg(long)]
-    prefer_http_download: bool,
-    /// Enable 302 redirect when possible
-    #[arg(long)]
-    redirect: bool,
+    serve_only: bool,
+
+    /// 挂载前是否做根 PROPFIND 预热(默认开,失败不阻塞)
+    #[arg(long, default_value = "true")]
+    warm_root: bool,
 
     #[command(subcommand)]
     subcommands: Option<Commands>,
-
-    #[arg(long, env = "REFRESH_CACHE_SECS_INTERVAL", default_value = "300")]
-    refresh_cache_secs_interval: u64,
-
-    /// Max seconds to wait for upload completion before returning early to client.
-    /// If upload is still in progress after this timeout, return success to avoid
-    /// client timeout while upload continues in the background.
-    /// Set to 0 to wait indefinitely. Defaults to 280 seconds.
-    #[arg(long, env = "UPLOAD_WAIT_TIMEOUT", default_value = "280")]
-    upload_wait_timeout: u64,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Scan QRCode
-    #[command(subcommand)]
-    Qr(QrCommand),
+    /// 显式启动 server(同 --serve-only)
+    Serve,
+    /// 健康检查(打印当前状态后退出)
+    Health,
 }
 
-#[derive(Subcommand, Debug)]
-enum QrCommand {
-    /// Scan QRCode login to get a token
-    Login,
-    /// Generate a QRCode
-    Generate,
-    /// Query the QRCode login result
-    #[command(arg_required_else_help = true)]
-    Query {
-        /// Query parameter sid
-        #[arg(long)]
-        sid: String,
-    },
-}
-
-pub fn start_periodic_invalidate(cache: Arc<Cache>, secs: u64) {
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(secs));
-        loop {
-            ticker.tick().await;
-            cache.invalidate_all();
+fn expand_home(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
         }
-    });
+    }
+    PathBuf::from(p)
+}
+
+fn generate_token() -> String {
+    let mut buf = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut buf);
+    hex::encode(buf)
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
+    eprintln!("[main] entering main");
+
+    // DEBUG: 捕获 panic 到 stderr + 文件,看为什么进程突然死
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("!!! PANIC: {}", info);
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("!!! BACKTRACE:\n{}", bt);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true).append(true).open("/tmp/wd_panic.log").ok();
+        if let Some(f) = f.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "PANIC: {}\n{}", info, bt);
+        }
+    }));
+
     let opt = Opt::parse();
+
     if env::var("RUST_LOG").is_err() {
         if opt.debug {
-            unsafe { env::set_var("RUST_LOG", "quarkdrive_webdav=debug,reqwest=debug"); }
+            unsafe { env::set_var("RUST_LOG", "quarkdrive_webdav=debug,reqwest=debug,proxy=debug"); }
         } else {
             unsafe { env::set_var("RUST_LOG", "quarkdrive_webdav=info,reqwest=warn"); }
         }
@@ -155,103 +151,282 @@ async fn main() -> anyhow::Result<()> {
         .with_timer(tracing_subscriber::fmt::time::time())
         .init();
 
-    let cookie_str = opt.quark_cookie.unwrap_or_else(||{ 
-        panic!("QUARK_COOKIE must be specified. Please set it in the environment or use --quark-cookie option.");
-    });
-    let init_cookie = Arc::new(DashMap::new());
-    for pair in cookie_str.split(';') {
-        if let Some((k, v)) = pair.trim().split_once('=') {
-            init_cookie.insert(k.trim().to_string(), v.trim().to_string());
+    if matches!(opt.subcommands, Some(Commands::Health)) {
+        let cookies = CookieStore::from_chromium(DEFAULT_BROWSERS).await?;
+        let mount_point = expand_home(&opt.mount_point);
+        let url = format!("https://{}:{}/", opt.host, opt.port);
+        let checker = HealthChecker::new(cookies, url, mount_point);
+        let r = checker.check().await;
+        println!("{r:?}");
+        return Ok(());
+    }
+
+    let serve_only = opt.serve_only || matches!(opt.subcommands, Some(Commands::Serve));
+
+    // 1. cookie
+    let cookie_store = if let Some(s) = opt.quark_cookie.clone() {
+        let map: std::collections::HashMap<String, String> = s
+            .split(';')
+            .filter_map(|p| p.trim().split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+            .collect();
+        let store = CookieStore::default();
+        store.replace(map);
+        store
+    } else {
+        CookieStore::from_chromium(DEFAULT_BROWSERS).await
+            .context("从浏览器抓 cookie 失败;请打开 Chrome 一次以解锁 keychain")?
+    };
+
+    // 2. webdav password
+    let webdav_password = match opt.auth_password.clone() {
+        Some(p) => p,
+        None => {
+            let p = generate_token();
+            mount::write_passwd(&p)?;
+            eprintln!("[main] webdav password saved"); info!("webdav password saved to disk");
+            p
         }
+    };
+
+    // 3. drive + fs
+    let cookie_map = cookie_store.snapshot();
+    let drive_cookie: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    for (k, v) in &cookie_map {
+        drive_cookie.insert(k.clone(), v.clone());
     }
     let drive_config = DriveConfig {
         api_base_url: "https://drive.quark.cn".to_string(),
-        cookie: init_cookie,
-    };
-    let auth_user = opt.auth_user;
-    let auth_password = opt.auth_password;
-    if (auth_user.is_some() && auth_password.is_none())
-        || (auth_user.is_none() && auth_password.is_some())
-    {
-        bail!("auth-user and auth-password must be specified together.");
-    }
-
-    let tls_config = match (opt.tls_cert, opt.tls_key) {
-        (Some(cert), Some(key)) => Some((cert, key)),
-        (None, None) => None,
-        _ => bail!("tls-cert and tls-key must be specified together."),
+        cookie: drive_cookie,
     };
     let drive = QuarkDrive::new(drive_config)?;
-    let mut fs = QuarkDriveFileSystem::new(drive, opt.root, opt.cache_size, opt.cache_ttl)?;
-    fs.set_no_trash(opt.no_trash)
-        .set_read_only(opt.read_only)
-        .set_upload_buffer_size(opt.upload_buffer_size)
-        .set_skip_upload_same_size(opt.skip_upload_same_size)
-        .set_prefer_http_download(opt.prefer_http_download)
-        .set_upload_wait_timeout(opt.upload_wait_timeout);
-    // §1.3 冷启动清空 dir_cache:对齐 Python DiskCache 单例首次创建时
-    // rmtree + mkdir 的语义;moka 是 in-memory LRU,所以 "truncate 磁盘 JSON"
-    // 无对应物,仅 invalidate_all 即可。
-    fs.dir_cache.invalidate_all();
-    debug!("dir_cache cold-cleared on startup (agent.md §1.3)");
-    let cache = Arc::new(fs.dir_cache.clone());
-    start_periodic_invalidate(cache.clone(), opt.refresh_cache_secs_interval);
-    let fs_for_browser = fs.clone();
-    let strip_prefix = opt.strip_prefix.clone();
-    let mut dav_server_builder = DavHandler::builder()
+    let mut fs = QuarkDriveFileSystem::new(drive, "/".to_string(), 1000u64, 600u64)?;
+    fs.set_read_only(false).set_no_trash(false);
+    let fs_for_webdav = fs.clone();
+
+    // 4. TLS
+    let (tls_cert, tls_key) = ensure_tls(&opt)?;
+
+    eprintln!("[main] step 5: spawning backend server task"); // 5. spawn 后端 WebDAV server
+    use dav_server::memls::MemLs;
+    use dav_server::DavHandler;
+    let dav_handler = DavHandler::builder()
         .filesystem(Box::new(fs))
         .locksystem(MemLs::new())
-        .read_buf_size(opt.read_buffer_size)
-        .autoindex(opt.auto_index)
-        .redirect(opt.redirect);
-    if let Some(prefix) = opt.strip_prefix {
-        dav_server_builder = dav_server_builder.strip_prefix(prefix);
-    }
-
-    let dav_server = dav_server_builder.build_handler();
-    debug!(
-        read_buffer_size = opt.read_buffer_size,
-        auto_index = opt.auto_index,
-        "webdav handler initialized"
-    );
-
-    let server = WebDavServer {
-        host: opt.host,
-        port: opt.port,
-        auth_user,
-        auth_password,
-        tls_config,
-        handler: dav_server,
-        fs: fs_for_browser,
-        strip_prefix,
+        .read_buf_size(10 * 1024 * 1024)
+        .autoindex(false)
+        .redirect(false)
+        .build_handler();
+    let backend_server = WebDavServer {
+        host: opt.backend_host.clone(),
+        port: opt.backend_port,
+        auth_user: Some(opt.auth_user.clone()),
+        auth_password: Some(webdav_password.clone()),
+        tls_config: None, // 后端明文 HTTP,只对本地
+        handler: dav_handler,
+        fs: fs_for_webdav,
+        strip_prefix: None,
     };
 
-    #[cfg(not(unix))]
-    server.serve().await?;
-    #[cfg(unix)]
-    {
-        let signals = Signals::new([SIGHUP])?;
-        let handle = signals.handle();
-        let signals_task = tokio::spawn(handle_signals(signals, cache));
+    eprintln!("[main] step 6: spawning proxy task"); eprintln!("[main] before proxy::run task"); // 6. spawn 终结代理
+    let proxy_cfg = ProxyConfig {
+        https_host: opt.host.clone(),
+        https_port: opt.port,
+        backend_host: opt.backend_host.clone(),
+        backend_port: opt.backend_port,
+        cert_path: tls_cert.clone(),
+        key_path: tls_key.clone(),
+        auth_user: opt.auth_user.clone(),
+        auth_password: webdav_password.clone(),
+        cookies: cookie_store.clone(),
+    };
 
-        server.serve().await?;
-
-        // Terminate the signal stream.
-        handle.close();
-        signals_task.await?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn handle_signals(mut signals: Signals, dir_cache: Arc<Cache>) {
-    while let Some(signal) = signals.next().await {
-        match signal {
-            SIGHUP => {
-                dir_cache.invalidate_all();
-                info!("directory cache invalidated by SIGHUP");
+    // 在 serve_only 模式下,只跑两个 server 然后阻塞
+    eprintln!("[main] serve_only path"); if serve_only {
+        // 先 spawn 两个 server,再 wait_for_port(注意顺序!)
+        // 后端 task
+        let backend_handle = tokio::spawn(async move {
+            if let Err(e) = backend_server.serve().await {
+                warn!(error = %e, "backend serve ended");
             }
-            _ => unreachable!(),
+        });
+        // 终结代理 task
+        let proxy_handle = tokio::spawn(async move {
+            if let Err(e) = proxy::run(proxy_cfg).await {
+                warn!(error = %e, "proxy serve ended");
+            }
+        });
+
+        // 等后端监听
+        wait_for_port(&opt.backend_host, opt.backend_port, 5).await?;
+        eprintln!("[main] backend ready"); info!(port = opt.backend_port, "backend ready");
+
+        // 等待代理就绪
+        wait_for_port(&opt.host, opt.port, 5).await?;
+        eprintln!("[main] proxy ready"); info!(port = opt.port, "https proxy ready");
+
+        // 任一退出 -> 整体退出
+        tokio::select! {
+            _ = backend_handle => { warn!("backend exited"); }
+            _ = proxy_handle => { warn!("proxy exited"); }
+        }
+        return Ok(());
+    }
+
+    // === 全功能模式(挂载 + 后台 + 12h cookie refresh + 健康检查 + tray) ===
+    // 后端 task
+    let backend_handle = tokio::spawn(async move {
+        if let Err(e) = backend_server.serve().await {
+            warn!(error = %e, "backend serve ended");
+        }
+    });
+    wait_for_port(&opt.backend_host, opt.backend_port, 5).await?;
+    eprintln!("[main] backend ready"); info!(port = opt.backend_port, "backend ready");
+
+    // 终结代理 task
+    let proxy_cfg_for_task = proxy_cfg.clone();
+    let proxy_handle = tokio::spawn(async move {
+        if let Err(e) = proxy::run(proxy_cfg_for_task).await {
+            warn!(error = %e, "proxy serve ended");
+        }
+    });
+    wait_for_port(&opt.host, opt.port, 5).await?;
+    eprintln!("[main] proxy ready"); info!(port = opt.port, "https proxy ready");
+
+    // 7. 根 PROPFIND 预热(防止 webdavfs 第一次看到空文件夹)
+    if opt.warm_root {
+        match proxy::warm_root(&proxy_cfg).await {
+            Ok(()) => info!("warm_root: ok"),
+            Err(e) => warn!(error = %e, "warm_root failed; mount may show empty dir briefly"),
         }
     }
+
+    // 8. mount(走 mount.rs;实际由 helper 挂载,这里尝试一下,失败不阻塞)
+    let mount_point = expand_home(&opt.mount_point);
+    let mount_cfg = MountConfig {
+        mount_point: mount_point.clone(),
+        webdav_url: format!("https://{}:{}", opt.host, opt.port),
+        user: opt.auth_user.clone(),
+        pass: webdav_password.clone(),
+    };
+    if let Err(e) = mount::mount(&mount_cfg).await {
+        warn!(error = %e, "mount failed; https proxy still running");
+        notifier::notify("QuarkDrive", &format!("挂载失败: {e}"));
+    }
+
+    // 9. health checker
+    let checker = Arc::new(HealthChecker::new(
+        cookie_store.clone(),
+        format!("https://{}:{}", opt.host, opt.port),
+        mount_point.clone(),
+    ));
+    let _health_task = health::spawn_loop(
+        checker.clone(),
+        mount_cfg.clone(),
+        Duration::from_secs(opt.health_check_secs),
+    );
+
+    // 10. 12h cookie refresh
+    let refresh_store = cookie_store.clone();
+    let _refresh_task = tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(opt.cookie_refresh_secs));
+        loop {
+            ticker.tick().await;
+            match CookieStore::from_chromium(DEFAULT_BROWSERS).await {
+                Ok(s) => {
+                    refresh_store.replace(s.snapshot());
+                    info!("cookies auto-refreshed");
+                }
+                Err(e) => warn!(error = %e, "scheduled cookie refresh failed"),
+            }
+        }
+    });
+
+    // 11. tray(阻塞)
+    let shutdown = Arc::new(Notify::new());
+    let tray_cfg = tray::TrayConfig {
+        mount_point: mount_point.clone(),
+        cookies: cookie_store.clone(),
+        health: checker.clone(),
+        shutdown: shutdown.clone(),
+    };
+
+    #[cfg(unix)]
+    {
+        let signals = Signals::new([SIGTERM, SIGINT])?;
+        let handle = signals.handle();
+        let sd = shutdown.clone();
+        let mp = mount_point.clone();
+        tokio::spawn(async move {
+            let mut s = signals;
+            while let Some(_sig) = s.next().await {
+                info!("signal received, shutting down");
+                let _ = mount::unmount(&mp).await;
+                sd.notify_waiters();
+                break;
+            }
+        });
+        tray::run(tray_cfg).await?;
+        handle.close();
+    }
+    #[cfg(not(unix))]
+    {
+        tray::run(tray_cfg).await?;
+    }
+
+    backend_handle.abort();
+    proxy_handle.abort();
+    let r = Ok(());
+    eprintln!("[main] returning {:?} from main", r);
+    r
+}
+
+async fn wait_for_port(host: &str, port: u16, timeout_secs: u64) -> Result<()> {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect((host, port)).is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("port {}:{} not listening within {}s", host, port, timeout_secs)
+}
+
+/// TLS 证书:有就用,没有就生成自签。
+fn ensure_tls(opt: &Opt) -> Result<(PathBuf, PathBuf)> {
+    if let (Some(c), Some(k)) = (&opt.tls_cert, &opt.tls_key) {
+        return Ok((c.clone(), k.clone()));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+    let dir = PathBuf::from(home).join("Library/Application Support/QuarkDrive");
+    std::fs::create_dir_all(&dir)?;
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    if cert.exists() && key.exists() {
+        return Ok((cert, key));
+    }
+    generate_self_signed(&cert, &key)?;
+    info!(cert = %cert.display(), key = %key.display(), "self-signed cert generated");
+    Ok((cert, key))
+}
+
+fn generate_self_signed(cert: &PathBuf, key: &PathBuf) -> Result<()> {
+    use std::process::Command;
+    let subj = "/CN=127.0.0.1";
+    let status = Command::new("/usr/bin/openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout",
+        ])
+        .arg(key)
+        .args(["-out"])
+        .arg(cert)
+        .args(["-days", "3650", "-subj", subj, "-addext", "subjectAltName=IP:127.0.0.1"])
+        .status()
+        .context("spawn openssl")?;
+    if !status.success() {
+        bail!("openssl exited with {:?}", status.code());
+    }
+    Ok(())
 }

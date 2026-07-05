@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.localquark.healthcheck</string>
+
+    <!-- 由 config.yaml 的 mount_check_interval 控制(默认 3600s = 1h) -->
+    <key>StartInterval</key>
+    <integer>__HEALTH_INTERVAL__</integer>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__HEALTH_PATH__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/healthcheck.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/healthcheck.stderr.log</string>
+</dict>
+</plist>

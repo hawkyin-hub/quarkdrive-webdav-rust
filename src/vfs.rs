@@ -15,6 +15,7 @@ use dav_server::{
     },
 };
 use futures_util::future::{ready, FutureExt};
+use futures_util::stream::StreamExt;
 use tracing::{debug, error, info, trace};
 use crate::{
     cache::Cache,
@@ -32,7 +33,7 @@ use sha1::Digest;
 use tokio::fs::File;
 
 use crate::drive::model::{Callback, UpAuthAndCommitRequest, UpPartMethodRequest};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 #[derive(Clone, Debug)]
 pub struct ActiveWriteInfo {
@@ -624,8 +625,6 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         error!(path = %path.display(), error = %err, "create folder failed");
                         FsError::GeneralFailure
                     })?;
-                // sleep 1s for quark server to update cache
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 self.dir_cache.invalidate(&path).await;
                 self.dir_cache.invalidate_parent(&path).await;
                 Ok(())
@@ -659,8 +658,6 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     error!(path = %path.display(), error = %err, "remove directory failed");
                     FsError::GeneralFailure
                 })?;
-            // sleep 1s for quark server to update cache
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             self.dir_cache.invalidate(&path).await;
             self.dir_cache.invalidate_parent(&path).await;
             Ok(())
@@ -690,8 +687,6 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     error!(path = %path.display(), error = %err, "remove file failed");
                     FsError::GeneralFailure
                 })?;
-            // sleep 1s for quark server to update cache
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             self.dir_cache.invalidate_parent(&path).await;
             Ok(())
         }
@@ -731,8 +726,6 @@ impl DavFileSystem for QuarkDriveFileSystem {
                             error!(from = %from.display(), to = %to.display(), error = %err, "rename file failed");
                             FsError::GeneralFailure
                         })?;
-                    // sleep 1s for quark server to update cache
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     self.dir_cache.invalidate_parent(&from).await;
                 } else {
                     return Err(FsError::Forbidden);
@@ -769,16 +762,12 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         }
                     }
                 }
-                // sleep 1s for quark server to update cache
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 self.dir_cache.invalidate_parent(&from).await;
                 self.dir_cache.invalidate_parent(&to).await;
 
             }
 
 
-            // sleep 1s for quark server to update cache
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             if is_dir {
                 self.dir_cache.invalidate(&from).await;
             }
@@ -1036,78 +1025,92 @@ impl QuarkDavFile {
         let fs = self.fs.clone();
 
         let handle = tokio::spawn(async move {
-            // upload chunks
+            // upload chunks (concurrent, buffered(4))
             let chunk_size = upload_state.chunk_size as usize;
-            let temp_path = &upload_state.temp_file_path;
-            let file = File::open(temp_path).await.map_err(|err| {
-                error!(file_name = %file_name, error = %err, "open temp file failed");
-                FsError::GeneralFailure
-            })?;
-            let mut file = tokio::io::BufReader::new(file);
-            let chunk_count = upload_state.chunk_count;
-            let mut etags = vec![String::new(); chunk_count as usize];
+            let temp_path = upload_state.temp_file_path.clone();
+            let chunk_count = upload_state.chunk_count as usize;
+            let total_size = upload_state.size as usize;
+            let mime_type = upload_state.mime_type.clone();
+            let obj_key = upload_state.obj_key.clone();
+            let bucket = upload_state.bucket.clone();
+            let task_id = upload_state.task_id.clone();
+            let upload_id_ref = &upload_state.upload_id;
+            let upload_url = upload_state.upload_url.clone();
+            let auth_info = upload_state.auth_info.clone();
+            let file_name_inner = file_name.clone();
+            let drive_inner = drive.clone();
 
-            let mime_type = &upload_state.mime_type;
-            let obj_key = &upload_state.obj_key;
-            let bucket = &upload_state.bucket;
-            let task_id = &upload_state.task_id;
-            let upload_id = &upload_state.upload_id;
-            let upload_url = &upload_state.upload_url;
-
-            for chunk_idx in 1..=chunk_count {
-                let bytes_to_read = if chunk_idx == chunk_count {
-                    let remaining_bytes = upload_state.size as usize - ((chunk_idx - 1) as usize * chunk_size);
+            // Bug fix: Quark API metadata returns part_thread:1, requiring
+            // SEQUENTIAL uploads only. The previous buffered(4) concurrent
+            // implementation triggered `PartNotSequential` errors and 500s.
+            use tokio::io::AsyncReadExt;
+            let mut etags: Vec<String> = Vec::with_capacity(chunk_count);
+            let mut early_finish = false;
+            'upload_loop: for chunk_idx in 1u32..=chunk_count as u32 {
+                let bytes_to_read = if chunk_idx as usize == chunk_count {
+                    let remaining_bytes = total_size - ((chunk_idx as usize - 1) * chunk_size);
                     std::cmp::min(remaining_bytes, chunk_size)
                 } else {
                     chunk_size
                 };
-                let mut buf = vec![0u8; bytes_to_read];
-                file.read_exact(&mut buf).await.map_err(|e| {
-                    error!(file_name = %file_name, error = %e, "read temp file failed");
+                let offset = (chunk_idx as usize - 1) * chunk_size;
+                let mut f = tokio::fs::File::open(&temp_path).await.map_err(|e| {
+                    error!(file_name = %file_name_inner, error = %e, "open temp file failed");
                     FsError::GeneralFailure
                 })?;
+                f.seek(SeekFrom::Start(offset as u64)).await.map_err(|e| {
+                    error!(file_name = %file_name_inner, error = %e, "seek temp file failed");
+                    FsError::GeneralFailure
+                })?;
+                let mut buf = vec![0u8; bytes_to_read];
+                f.read_exact(&mut buf).await.map_err(|e| {
+                    error!(file_name = %file_name_inner, error = %e, "read temp file failed");
+                    FsError::GeneralFailure
+                })?;
+                drop(f);
                 let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
                 let utc_time = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-                let auth_meta = drive.up_part_auth_meta(mime_type, &utc_time, bucket, obj_key, chunk_idx as u32, upload_id).await.map_err(|err| {
-                    error!(file_name = %file_name, error = %err, "get upload part auth meta failed");
+                let auth_meta = drive_inner.up_part_auth_meta(&mime_type, &utc_time, &bucket, &obj_key, chunk_idx, &upload_state.upload_id).await.map_err(|err| {
+                    error!(file_name = %file_name_inner, error = %err, "get upload part auth meta failed");
                     FsError::GeneralFailure
                 })?;
-                let auth_info = &upload_state.auth_info;
-                let auth_res = drive.auth(auth_info, &auth_meta, task_id).await.map_err(|err| {
-                    error!(file_name = %file_name, error = %err, "auth upload part failed");
+                let auth_res = drive_inner.auth(&auth_info, &auth_meta, &task_id).await.map_err(|err| {
+                    error!(file_name = %file_name_inner, error = %err, "auth upload part failed");
                     FsError::GeneralFailure
                 })?;
                 let up_req = UpPartMethodRequest {
                     auth_key: auth_res.data.auth_key,
-                    mime_type: upload_state.mime_type.clone(),
+                    mime_type: mime_type.clone(),
                     utc_time,
                     bucket: bucket.clone(),
                     upload_url: upload_url.clone(),
                     obj_key: obj_key.clone(),
-                    part_number: chunk_idx as u32,
-                    upload_id: upload_id.to_string(),
+                    part_number: chunk_idx,
+                    upload_id: upload_state.upload_id.clone(),
                     part_bytes: buf,
                 };
-                let res = drive.up_part(up_req).await.map_err(|err| {
-                    error!(file_name = %file_name, error = %err, "upload chunk failed");
+                let res = drive_inner.up_part(up_req).await.map_err(|err| {
+                    error!(file_name = %file_name_inner, error = %err, "upload chunk failed");
                     FsError::GeneralFailure
                 })?;
-                let etag_from_up_part = res.ok_or_else(|| {
-                    error!(file_name = %file_name, "up_part returned None");
+                let etag = res.ok_or_else(|| {
+                    error!(file_name = %file_name_inner, "up_part returned None");
                     FsError::GeneralFailure
                 })?;
-                if etag_from_up_part == "finish" {
-                    fs.register_active_write(&parent_path, &file_name, upload_state.size, temp_path).await;
-                    // cleanup
-                    if tokio::fs::metadata(temp_path).await.is_ok() {
-                        let _ = tokio::fs::remove_file(temp_path).await;
-                    }
-                    fs.remove_uploading_file(&parent_path, &file_name);
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    fs.dir_cache.invalidate(parent_dir.as_path()).await;
-                    return Ok(());
+                if etag == "finish" {
+                    early_finish = true;
+                    break 'upload_loop;
                 }
-                etags[(chunk_idx - 1) as usize] = etag_from_up_part;
+                etags.push(etag);
+            }
+            if early_finish {
+                fs.register_active_write(&parent_path, &file_name_inner, upload_state.size, &temp_path).await;
+                if tokio::fs::metadata(&temp_path).await.is_ok() {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                }
+                fs.remove_uploading_file(&parent_path, &file_name_inner);
+                fs.dir_cache.invalidate(parent_dir.as_path()).await;
+                return Ok(());
             }
 
             // commit
@@ -1120,7 +1123,7 @@ impl QuarkDavFile {
                 callback,
                 bucket: bucket.clone(),
                 obj_key: obj_key.clone(),
-                upload_id: upload_id.clone(),
+                upload_id: upload_id_ref.to_string(),
                 auth_info: upload_state.auth_info.clone(),
                 task_id: task_id.clone(),
                 upload_url: upload_url.clone(),
@@ -1129,18 +1132,17 @@ impl QuarkDavFile {
                 error!(file_name = %file_name, error = %err, "commit upload failed");
                 FsError::GeneralFailure
             })?;
-            drive.finish(obj_key, task_id).await.map_err(|err| {
+            drive.finish(&obj_key, &task_id).await.map_err(|err| {
                 error!(file_name = %file_name, error = %err, "finish upload failed");
                 FsError::GeneralFailure
             })?;
 
-            fs.register_active_write(&parent_path, &file_name, upload_state.size, temp_path).await;
+            fs.register_active_write(&parent_path, &file_name, upload_state.size, &temp_path).await;
             // cleanup
-            if tokio::fs::metadata(temp_path).await.is_ok() {
-                let _ = tokio::fs::remove_file(temp_path).await;
+            if tokio::fs::metadata(&temp_path).await.is_ok() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
             }
             fs.remove_uploading_file(&parent_path, &file_name);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             fs.dir_cache.invalidate(parent_dir.as_path()).await;
 
             Ok::<(), FsError>(())
@@ -1292,12 +1294,9 @@ impl QuarkDavFile {
             error!(file_name = %self.file.file_name, error = %e, "write to temp file failed");
             FsError::GeneralFailure
         })?;
-        file.flush().await.map_err(|e| {
-            error!(file_name = %self.file.file_name, error = %e, "flush temp file failed");
-            FsError::GeneralFailure
-        })?;
-        self.upload_chunk().await?;
-        self.after_flush().await?;
+        // Bug fix: actual upload runs in flush() -> do_flush() after all body
+        // bytes are written. Calling upload_chunk() here ran on an empty file
+        // and produced duplicate uploads.
 
         Ok(())
     }
@@ -1327,10 +1326,6 @@ impl QuarkDavFile {
             })?;
         file.write_all(&bytes).await.map_err(|e| {
             error!(file_name = %self.file.file_name, error = %e, "write to temp file failed");
-            FsError::GeneralFailure
-        })?;
-        file.flush().await.map_err(|e| {
-            error!(file_name = %self.file.file_name, error = %e, "flush temp file failed");
             FsError::GeneralFailure
         })?;
         // 更新哈希
@@ -1432,7 +1427,7 @@ impl QuarkDavFile {
             callback: callback,
             bucket: bucket.clone(),
             obj_key: obj_key.clone(),
-            upload_id: upload_id.clone(),
+            upload_id: upload_id.to_string(),
             auth_info: auth_info.clone(),
             task_id: task_id.clone(),
             upload_url: upload_url.clone(),
@@ -1453,8 +1448,8 @@ impl QuarkDavFile {
 
     async fn delete_temp_file(&self) -> Result<(), FsError> {
         let temp_path = &self.upload_state.temp_file_path;
-        if tokio::fs::metadata(temp_path).await.is_ok() {
-            if let Err(err) = tokio::fs::remove_file(temp_path).await {
+        if tokio::fs::metadata(&temp_path).await.is_ok() {
+            if let Err(err) = tokio::fs::remove_file(&temp_path).await {
                 error!(file_id = %self.file.fid, file_name = %self.file.file_name, error = %err, "remove temp file failed");
             }
         }
@@ -1466,8 +1461,6 @@ impl QuarkDavFile {
         let parent_path = self.file.parent_path.as_ref().unwrap().as_str();
         self.fs.remove_uploading_file(parent_path, &self.file.file_name);
         self.upload_state = UploadState::default();
-        // sleep 1s for quark server to update cache
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
         Ok(())
     }

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Stage 13b.1: LaunchDaemon for com.localquark.webdav-helper.
+  Installed by bin/install-helper.sh to /Library/LaunchDaemons/.
+
+  KeepAlive { SuccessfulExit: false } matches the LaunchAgent in
+  bin/com.localquark.webdav.plist.tmpl: only restart on non-zero
+  exit. SuccessfulExit: true would cause launchd to relaunch helper
+  every time it clean-shuts down, which is wrong for a long-running
+  XPC listener.
+
+  MachServices registers the XPC port that run-localquark /
+  teardown-localquark talk to. Name must match main.swift's
+  NSXPCListener(machServiceName:).
+
+  RunAtLoad = true so a one-shot install + bootstrap puts the
+  service up immediately, without waiting for first connection.
+
+  StandardErrorPath / StandardOutPath route helper NSLog to the
+  unified log so on-call can `log show --predicate ...` it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.localquark.webdav-helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/com.localquark.webdav-helper</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.localquark.webdav-helper.xpc</key>
+        <true/>
+    </dict>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/com.localquark.webdav-helper.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/com.localquark.webdav-helper.err.log</string>
+    <!-- HOME is set so the helper can resolve paths like
+         $HOME/Library/Application Support/LocalQuark/certs/cert.pem
+         inside the trustCert XPC method. Without this, NSHomeDirectory()
+         inside the LaunchDaemon returns /var/root, which has no cert
+         file. install-helper.sh substitutes __HOME__ at install time. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>

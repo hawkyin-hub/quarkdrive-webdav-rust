@@ -1,0 +1,24 @@
+[package]
+name = "localquark-app"
+version = "2.0.0"
+description = "LocalQuark - Quark Cloud Drive WebDAV Client"
+authors = ["LocalQuark Team"]
+license = "MIT"
+repository = "https://github.com/hawkyin-hub/quarkdrive-webdav-rust"
+edition = "2021"
+rust-version = "1.75"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.6", features = ["shell-open", "system-tray", "icon-png"] }
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = []

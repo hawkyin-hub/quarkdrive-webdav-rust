@@ -1,0 +1,33 @@
+# Rust build artifacts
+target/
+quarkdrive-webdav/target/
+quarkdrive-webdav/dist/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# App bundle output
+dist/*.app
+dist/*.dmg
+dist/*.zip
+
+# Mount test leftovers
+mount_test/
+
+# Logs & misc
+*.log
+codex.log
+qupla.txt
+Quark
+
+# Legacy build cache
+legacy/LocalQuark-python-bundle/LocalQuark/helper/.build/
+legacy/LocalQuark-python-bundle/decoded/
+legacy/LocalQuark_decoded/
+legacy/LocalQuark_extracted/
+legacy/dist-legacy/
+
+# Backups
+*.bak
+*.bak2

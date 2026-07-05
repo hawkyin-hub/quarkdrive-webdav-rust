@@ -250,8 +250,9 @@ async fn main() -> Result<()> {
             }
         });
         // 终结代理 task
+        let proxy_cfg_for_task = proxy_cfg.clone();
         let proxy_handle = tokio::spawn(async move {
-            if let Err(e) = proxy::run(proxy_cfg).await {
+            if let Err(e) = proxy::run(proxy_cfg_for_task).await {
                 warn!(error = %e, "proxy serve ended");
             }
         });
@@ -263,6 +264,14 @@ async fn main() -> Result<()> {
         // 等待代理就绪
         wait_for_port(&opt.host, opt.port, 5).await?;
         eprintln!("[main] proxy ready"); info!(port = opt.port, "https proxy ready");
+
+        // 根 PROPFIND 预热(防止 webdavfs 第一次看到空文件夹并卡死)
+        if opt.warm_root {
+            match proxy::warm_root(&proxy_cfg).await {
+                Ok(()) => info!("warm_root: ok"),
+                Err(e) => warn!(error = %e, "warm_root failed; mount may show empty dir briefly"),
+            }
+        }
 
         // 任一退出 -> 整体退出
         tokio::select! {

@@ -73,6 +73,9 @@ pub struct QuarkDriveFileSystem {
     /// the write lock — if a newer generation exists the stale upload is
     /// skipped (temp file deleted, no network traffic wasted).
     upload_generation: Arc<DashMap<PathBuf, u64>>,
+    /// Per-chunk async mutex registry. Each value is an `AsyncMutex<()>` that
+    /// prevents concurrent threads from downloading the same chunk from network simultaneously.
+    chunk_locks: Arc<DashMap<(String, u64), Arc<AsyncMutex<()>>>>,
 }
 
 impl QuarkDriveFileSystem {
@@ -146,6 +149,7 @@ impl QuarkDriveFileSystem {
             temp_seq: Arc::new(AtomicU64::new(0)),
             write_locks: Arc::new(DashMap::new()),
             upload_generation: Arc::new(DashMap::new()),
+            chunk_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -164,6 +168,19 @@ impl QuarkDriveFileSystem {
         // and return the winning entry.
         self.write_locks
             .entry(path)
+            .or_insert(new_lock.clone())
+            .clone()
+    }
+
+    /// Resolve (and lazily create) the per-chunk download mutex.
+    pub(crate) fn chunk_lock_for(&self, path: String, start_align: u64) -> Arc<AsyncMutex<()>> {
+        let key = (path, start_align);
+        if let Some(m) = self.chunk_locks.get(&key) {
+            return m.value().clone();
+        }
+        let new_lock = Arc::new(AsyncMutex::new(()));
+        self.chunk_locks
+            .entry(key)
             .or_insert(new_lock.clone())
             .clone()
     }
@@ -1109,6 +1126,9 @@ impl QuarkDavFile {
                     let _ = tokio::fs::remove_file(&temp_path).await;
                 }
                 fs.remove_uploading_file(&parent_path, &file_name_inner);
+                let full_path = parent_dir.join(&file_name_inner);
+                fs.dir_cache.invalidate(full_path.as_path()).await;
+                fs.dir_cache.invalidate_chunks(&full_path.to_string_lossy());
                 fs.dir_cache.invalidate(parent_dir.as_path()).await;
                 return Ok(());
             }
@@ -1143,6 +1163,9 @@ impl QuarkDavFile {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
             fs.remove_uploading_file(&parent_path, &file_name);
+            let full_path = parent_dir.join(&file_name);
+            fs.dir_cache.invalidate(full_path.as_path()).await;
+            fs.dir_cache.invalidate_chunks(&full_path.to_string_lossy());
             fs.dir_cache.invalidate(parent_dir.as_path()).await;
 
             Ok::<(), FsError>(())
@@ -1461,6 +1484,9 @@ impl QuarkDavFile {
         let parent_path = self.file.parent_path.as_ref().unwrap().as_str();
         self.fs.remove_uploading_file(parent_path, &self.file.file_name);
         self.upload_state = UploadState::default();
+        let full_path = self.parent_dir.join(&self.file.file_name);
+        self.fs.dir_cache.invalidate(full_path.as_path()).await;
+        self.fs.dir_cache.invalidate_chunks(&full_path.to_string_lossy());
         self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
         Ok(())
     }
@@ -1549,7 +1575,7 @@ impl DavFile for QuarkDavFile {
         );
         async move {
             if self.file.fid.is_empty() {
-                // 1. 尝试自愈：如果在 active_writes 里有记录，返回内存缓存数据
+                // 1. 尝试自愈：如果在 active_writes 里有记录，返回内存缓存 data
                 let full_path = self.parent_dir.join(&self.file.file_name);
                 let path_str = full_path.to_string_lossy().to_string();
                 if let Some(info) = self.fs.active_writes.get(&path_str) {
@@ -1573,51 +1599,157 @@ impl DavFile for QuarkDavFile {
                 // upload in progress
                 return Err(FsError::NotFound);
             }
-            // 检查现有 URL 是否有效
-            let is_valid = self.file.download_url.as_ref()
-                .map(|url| !is_url_expired(url))
-                .unwrap_or(false);
 
-            if !is_valid {
-                let new_url = self.get_download_url().await.map_err(|e| {
-                    error!(file_name = %self.file.file_name, error = ?e, "get_download_url failed");
-                    FsError::GeneralFailure
-                })?;
-                self.file.download_url = Some(new_url);
+            let read_start = self.current_pos;
+            let read_len = count as u64;
+            let file_size = self.file.size;
+            if file_size == 0 {
+                return Ok(Bytes::new());
             }
-            let download_url = match self.file.download_url.as_ref() {
-                Some(url) => url,
-                None => {
-                    // 详细记录文件信息
-                    error!(
-                        "文件缺少下载URL: {:?}\n文件元数据: {:#?}",
-                        self.file.download_url,
-                        self.file);
-                    return Err(dav_server::fs::FsError::NotFound);
+            if read_start >= file_size {
+                return Ok(Bytes::new());
+            }
+            let read_end = std::cmp::min(read_start + read_len, file_size);
+            if read_start >= read_end {
+                return Ok(Bytes::new());
+            }
+
+            let chunk_cache_path = self.parent_dir
+                .join(&self.file.file_name)
+                .to_string_lossy()
+                .to_string();
+
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4MB
+            let start_chunk_idx = read_start / CHUNK_SIZE;
+            let end_chunk_idx = (read_end - 1) / CHUNK_SIZE;
+
+            let mut result_buf = vec![0u8; (read_end - read_start) as usize];
+            const CHUNK_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
+            for chunk_idx in start_chunk_idx..=end_chunk_idx {
+                let chunk_align_start = chunk_idx * CHUNK_SIZE;
+                let chunk_len = if chunk_align_start + CHUNK_SIZE > file_size {
+                    file_size - chunk_align_start
+                } else {
+                    CHUNK_SIZE
+                } as usize;
+                let chunk_align_end = chunk_align_start + chunk_len as u64;
+
+                // 1. 获取该分块的锁，保证同一时间只有一个线程在下载该文件的这个 chunk
+                let chunk_lock = self.fs.chunk_lock_for(chunk_cache_path.clone(), chunk_align_start);
+                let _guard = chunk_lock.lock().await;
+
+                // 2. 尝试从磁盘缓存中读取
+                let mut data = None;
+                if let Some(cached) = self.fs.dir_cache.read_chunk(&chunk_cache_path, chunk_align_start, chunk_len).await {
+                    debug!(
+                        path = %chunk_cache_path, pos = chunk_align_start, count = chunk_len,
+                        "chunk cache: hit, skipping network download"
+                    );
+                    data = Some(cached);
+                } else {
+                    // Cache miss: 从网络下载
+                    let mut retries = 0;
+                    let max_retries = 2;
+                    while retries < max_retries {
+                        let is_valid = self.file.download_url.as_ref()
+                            .map(|url| !is_url_expired(url))
+                            .unwrap_or(false);
+
+                        if !is_valid {
+                            let new_url = match tokio::time::timeout(
+                                std::time::Duration::from_secs(8),
+                                self.get_download_url(),
+                            ).await {
+                                Ok(Ok(url)) => url,
+                                Ok(Err(e)) => {
+                                    error!(file_name = %self.file.file_name, error = %e, "get_download_url failed");
+                                    self.file.download_url = None;
+                                    break;
+                                }
+                                Err(_) => {
+                                    error!(file_name = %self.file.file_name, "get_download_url timeout 8s");
+                                    self.file.download_url = None;
+                                    break;
+                                }
+                            };
+                            self.file.download_url = Some(new_url);
+                        }
+
+                        let download_url = match self.file.download_url.as_ref() {
+                            Some(url) => url,
+                            None => {
+                                error!(file_name = %self.file.file_name, "download_url is None");
+                                break;
+                            }
+                        };
+
+                        if download_url.is_empty() {
+                            error!(file_name = %self.file.file_name, "download_url is empty");
+                            break;
+                        }
+
+                        let download_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(CHUNK_DOWNLOAD_TIMEOUT_SECS),
+                            self.fs.drive.download(download_url.clone(), Some((chunk_align_start, chunk_len))),
+                        ).await;
+
+                        match download_result {
+                            Ok(Ok(downloaded_data)) => {
+                                if downloaded_data.len() == chunk_len {
+                                    // 异步写入磁盘缓存
+                                    self.fs.dir_cache.write_chunk(
+                                        chunk_cache_path.clone(),
+                                        chunk_align_start,
+                                        downloaded_data.to_vec(),
+                                    );
+                                    data = Some(downloaded_data);
+                                    break;
+                                } else {
+                                    error!(
+                                        file_name = %self.file.file_name,
+                                        expected = chunk_len,
+                                        actual = downloaded_data.len(),
+                                        "download chunk size mismatch, retrying..."
+                                    );
+                                    self.file.download_url = None;
+                                    retries += 1;
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                error!(file_name = %self.file.file_name, error = %err, "download chunk failed, resetting URL to retry...");
+                                self.file.download_url = None;
+                                retries += 1;
+                            }
+                            Err(_) => {
+                                error!(file_name = %self.file.file_name, pos = chunk_align_start, count = chunk_len,
+                                    "download chunk timed out after {}s, resetting URL to retry...", CHUNK_DOWNLOAD_TIMEOUT_SECS);
+                                self.file.download_url = None;
+                                retries += 1;
+                            }
+                        }
+                    }
                 }
-            };
 
-            if !download_url.is_empty() {
-                // 修复：加 30s 超时，防止 CDN 慢连接或 stall 导致 Finder 卡死。
-                // 超时后返回 GeneralFailure，webdavfs 会重试而不是永远 hang。
-                let content = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    self.fs.drive.download(download_url.clone(), Some((self.current_pos, count))),
-                )
-                .await
-                .map_err(|_| {
-                    error!(file_name = %self.file.file_name, pos = self.current_pos, count = count, "download chunk timed out after 30s");
-                    FsError::GeneralFailure
-                })?
-                .map_err(|err| {
-                    error!(file_name = %self.file.file_name, error = %err, "download chunk failed");
-                    FsError::GeneralFailure
-                })?;
-                self.current_pos += content.len() as u64;
-                return Ok(content);
-            } else {
-                return Err(FsError::NotFound);
+                // 3. 提取我们需要的部分并复制到 result_buf
+                if let Some(chunk_data) = data {
+                    let overlap_start = std::cmp::max(read_start, chunk_align_start);
+                    let overlap_end = std::cmp::min(read_end, chunk_align_end);
+                    if overlap_start < overlap_end {
+                        let chunk_offset = (overlap_start - chunk_align_start) as usize;
+                        let chunk_end_offset = (overlap_end - chunk_align_start) as usize;
+                        let result_offset = (overlap_start - read_start) as usize;
+                        let result_end_offset = (overlap_end - read_start) as usize;
+                        
+                        result_buf[result_offset..result_end_offset].copy_from_slice(&chunk_data[chunk_offset..chunk_end_offset]);
+                    }
+                } else {
+                    return Err(FsError::GeneralFailure);
+                }
             }
+
+            self.current_pos = read_end;
+            Ok(Bytes::from(result_buf))
         }
             .boxed()
     }
@@ -1753,24 +1885,24 @@ mod tests {
     }
 
     #[test]
-    fn test_is_url_expired_within_60s_buffer() {
-        // Get current time + 30 seconds (within the 60s buffer)
+    fn test_is_url_expired_within_300s_buffer() {
+        // Get current time + 150 seconds (within the 300s buffer)
         let expires = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 30;
+            .as_secs() + 150;
         let url = format!("https://example.com/file?Expires={}", expires);
-        // Should be considered expired (within 60s buffer)
+        // Should be considered expired (within 300s buffer)
         assert!(is_url_expired(&url));
     }
 
     #[test]
-    fn test_is_url_expired_beyond_60s_buffer() {
-        // Get current time + 120 seconds (beyond the 60s buffer)
+    fn test_is_url_expired_beyond_300s_buffer() {
+        // Get current time + 400 seconds (beyond the 300s buffer)
         let expires = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 120;
+            .as_secs() + 400;
         let url = format!("https://example.com/file?Expires={}", expires);
         assert!(!is_url_expired(&url));
     }
@@ -1789,13 +1921,13 @@ mod tests {
 
     #[test]
     fn test_is_url_expired_exactly_at_boundary() {
-        // Get current time + exactly 60 seconds (at boundary)
+        // Get current time + exactly 300 seconds (at boundary)
         let expires = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 60;
+            .as_secs() + 300;
         let url = format!("https://example.com/file?Expires={}", expires);
-        // current_ts + 60 >= expires → should be expired at boundary
+        // current_ts + 300 >= expires → should be expired at boundary
         assert!(is_url_expired(&url));
     }
 

@@ -137,7 +137,7 @@ impl WebDavServer {
                                     resp
                                 }
                             });
-                            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                            if let Err(e) = auto::Builder::new(TokioExecutor::new()).http1().keep_alive(false)
                                 .serve_connection(io, svc)
                                 .await
                             {
@@ -165,7 +165,7 @@ impl WebDavServer {
                             resp
                         }
                     });
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                    if let Err(e) = auto::Builder::new(TokioExecutor::new()).http1().keep_alive(false)
                         .serve_connection(io, svc)
                         .await
                     {

@@ -11,7 +11,9 @@ use std::io;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -28,10 +30,19 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{self, ServerConfig, SupportedProtocolVersion};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use futures_util::TryStreamExt;
+use http_body_util::StreamBody;
+use hyper::body::Frame;
 
 use crate::cookie::CookieStore;
 
 /// 终结代理配置
+type CacheEntry = (Instant, hyper::StatusCode, hyper::HeaderMap, bytes::Bytes);
+static PROPFIND_CACHE: OnceLock<Mutex<HashMap<(String, String), CacheEntry>>> = OnceLock::new();
+fn get_propfind_cache() -> &'static Mutex<HashMap<(String, String), CacheEntry>> {
+    PROPFIND_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Clone)]
 pub struct ProxyConfig {
     pub https_host: String,
@@ -46,15 +57,15 @@ pub struct ProxyConfig {
     pub cookies: CookieStore,
 }
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 fn empty_body() -> BoxBody {
-    Full::new(Bytes::new()).map_err(|never| match never {}).boxed()
+    Full::new(Bytes::new()).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed()
 }
 fn text_body(s: String) -> BoxBody {
-    Full::new(Bytes::from(s)).map_err(|never| match never {}).boxed()
+    Full::new(Bytes::from(s)).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed()
 }
 fn bytes_body(b: Bytes) -> BoxBody {
-    Full::new(b).map_err(|never| match never {}).boxed()
+    Full::new(b).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed()
 }
 
 /// 启动终结代理,阻塞到 process 被杀。
@@ -150,6 +161,46 @@ async fn handle_request(
     let path = uri.path().to_string();
     info!(method = %method, uri = %uri, "PROXY request");
 
+    // 拦截 AppleDouble (._) 临时文件请求，直接在代理入口返回 404，
+    // 避免疯狂的系统级隐藏文件探测拖垮后端 VFS 及夸克 API 线程池。
+    let decoded_path = percent_encoding::percent_decode_str(&path).decode_utf8_lossy();
+    let last_segment = decoded_path.split('/').last().unwrap_or("");
+    if last_segment.starts_with("._") {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Length", "0")
+            .header("Connection", "close")
+            .body(empty_body())
+            .unwrap());
+    }
+
+    // 拦截并读取 PROPFIND 代理层缓存
+    if method.as_str() == "PROPFIND" {
+        let depth = req.headers()
+            .get("Depth")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0")
+            .to_string();
+        let cache_key = (decoded_path.to_string(), depth);
+        let hit = {
+            let cache = get_propfind_cache().lock().unwrap();
+            cache.get(&cache_key).cloned().map(|(ts, status, headers, body)| {
+                (ts.elapsed() < Duration::from_secs(5), status, headers, body)
+            })
+        };
+        if let Some((valid, status, headers, body)) = hit {
+            if valid {
+                info!(path = %cache_key.0, depth = %cache_key.1, "Proxy PROPFIND cache HIT");
+                let mut builder = Response::builder().status(status);
+                *builder.headers_mut().unwrap() = headers;
+                return Ok(builder.body(Full::new(body).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed()).unwrap());
+            } else {
+                let mut cache = get_propfind_cache().lock().unwrap();
+                cache.remove(&cache_key);
+            }
+        }
+    }
+
     // 跟原 Python https_proxy.py 一样:代理不做 auth check,直接透传
     // webdavfs 的 Authorization header(keychain 里取的)给后端 dav-server 验。
     // (原版 _send_streaming 是个 dumb forwarder,401 由后端返回 + 加 WWW-Authenticate)
@@ -169,7 +220,7 @@ async fn handle_request(
 
     // 其他方法全部透传到 8080
     info!(method = %method, uri = %uri, "proxy -> backend");
-    match proxy_to_backend(req, &cfg).await {
+    match proxy_to_backend(req, &cfg, &decoded_path).await {
         Ok(resp) => {
             info!(status = %resp.status(), "backend -> client");
             Ok(resp)
@@ -207,7 +258,9 @@ fn check_auth(req: &Request<Incoming>, cfg: &ProxyConfig) -> bool {
         Some(v) => v,
         None => return false,
     };
-    u == cfg.auth_user && p == cfg.auth_password
+    let u_clean = u.strip_suffix('x').unwrap_or(u);
+    let p_clean = p.strip_suffix('x').unwrap_or(p);
+    u_clean == cfg.auth_user && p_clean == cfg.auth_password
 }
 
 fn lock_response() -> Response<BoxBody> {
@@ -281,6 +334,7 @@ fn error_with_status(
 async fn proxy_to_backend(
     req: Request<Incoming>,
     cfg: &ProxyConfig,
+    decoded_path: &str,
 ) -> Result<Response<BoxBody>> {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -332,7 +386,7 @@ async fn proxy_to_backend(
     let auth_b64 = base64::engine::general_purpose::STANDARD.encode(auth);
 
     let mut fwd = client
-        .request(method, &backend_url)
+        .request(method.clone(), &backend_url)
         .header(
             "Host",
             format!("{}:{}", cfg.backend_host, cfg.backend_port),
@@ -340,7 +394,7 @@ async fn proxy_to_backend(
         .header("Authorization", format!("Basic {}", auth_b64))
         .header("Connection", "close");
 
-    for (k, v) in fwd_headers {
+    for (k, v) in &fwd_headers {
         let lk = k.to_lowercase();
         if matches!(
             lk.as_str(),
@@ -348,7 +402,7 @@ async fn proxy_to_backend(
         ) {
             continue;
         }
-        fwd = fwd.header(&k, &v);
+        fwd = fwd.header(k, v);
     }
 
     let res = if body_bytes.is_empty() {
@@ -383,10 +437,31 @@ async fn proxy_to_backend(
         HeaderValue::from_static("close"),
     );
 
-    // 一次性 read body(简化版;大文件 streaming 可后续优化)
-    let body = match resp.bytes().await {
-        Ok(b) => bytes_body(b),
-        Err(e) => return Err(anyhow::anyhow!("read backend body: {}", e)),
+    let body = if method == hyper::Method::GET {
+        // 只有 GET 请求走流式传输，消除大文件全内存缓冲
+        let stream = resp.bytes_stream().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+        let frame_stream = stream.map_ok(Frame::data);
+        StreamBody::new(frame_stream).boxed()
+    } else {
+        let body_bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return Err(anyhow::anyhow!("read backend body: {}", e)),
+        };
+        
+        // 只有 PROPFIND 且 status 是 207 Multi-Status 时存入代理缓存
+        if method.as_str() == "PROPFIND" && status == hyper::StatusCode::MULTI_STATUS {
+            let depth = fwd_headers.iter()
+                .find(|(k, _)| k.to_lowercase() == "depth")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("0")
+                .to_string();
+            let cache_key = (decoded_path.to_string(), depth);
+            let mut cache = get_propfind_cache().lock().unwrap();
+            cache.insert(cache_key, (Instant::now(), status, header_map.clone(), body_bytes.clone()));
+            info!(path = %decoded_path, "Proxy PROPFIND cache INSERT");
+        }
+        
+        Full::new(body_bytes).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed()
     };
 
     let mut builder = Response::builder().status(status);

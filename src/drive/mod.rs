@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::time;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use base64::{Engine as _, engine::{self, general_purpose}, alphabet};
 
@@ -28,6 +28,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use headers::Cookie;
 use moka::future::FutureExt;
+use futures_util::StreamExt;
 
 pub mod model;
 
@@ -405,25 +406,99 @@ impl QuarkDrive {
 
     pub async fn download<U: IntoUrl>(&self, url: U, range: Option<(u64, usize)>) -> Result<Bytes> {
         use reqwest::header::RANGE;
-        let cookie = self.resolve_cookies().await;
         let url = url.into_url()?;
-        let res = if let Some((start_pos, size)) = range {
-            let end_pos = start_pos + size as u64 - 1;
-            debug!(url = %url, start = start_pos, end = end_pos, "download file");
-            let range = format!("bytes={}-{}", start_pos, end_pos);
-            self.download_client
-                .get(url)
-                .header(RANGE, range)
-                .header("Cookie", cookie)
-                .send()
-                .await?
-                .error_for_status()?
-        } else {
-            debug!(url = %url, "download file");
-            self.download_client.get(url).send().await?.error_for_status()?
-        };
-        self.update_cookie_from_response(&res).await;
-        Ok(res.bytes().await?)
+        // Range 请求时只读到 target 字节，攒够就立刻返回。
+        // 这是修复卡死的关键：旧实现 res.bytes().await 等完整 body，
+        // 被 CDN 慢速掐断时整个 read_bytes() 卡住 30s+。
+        // 对齐 legacy Python https_proxy.py v4：64KB chunk + 攒够即返。
+        let target = range.map(|(_, size)| size).unwrap_or(usize::MAX);
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+            let cookie = self.resolve_cookies().await;
+            let res_result = if let Some((start_pos, size)) = range {
+                let end_pos = start_pos + size as u64 - 1;
+                debug!(url = %url, start = start_pos, end = end_pos, attempt = attempts, "download file (range)");
+                let range_hdr = format!("bytes={}-{}", start_pos, end_pos);
+                self.download_client
+                    .get(url.clone())
+                    .header(RANGE, range_hdr)
+                    .header("Cookie", cookie)
+                    .send()
+                    .await
+            } else {
+                debug!(url = %url, attempt = attempts, "download file (full)");
+                self.download_client
+                    .get(url.clone())
+                    .header("Cookie", cookie)
+                    .send()
+                    .await
+            };
+
+            match res_result {
+                Ok(res) => {
+                    match res.error_for_status() {
+                        Ok(res) => {
+                            self.update_cookie_from_response(&res).await;
+                            // 流式读取 body：攒够 target 字节就立刻返回，
+                            // 中途 stream 报错时返回错误让外层 retry。
+                            let mut stream = res.bytes_stream();
+                            let mut buf = bytes::BytesMut::new();
+                            let mut stream_err: Option<anyhow::Error> = None;
+                            while buf.len() < target {
+                                match stream.next().await {
+                                    Some(Ok(chunk)) => {
+                                        let need = target - buf.len();
+                                        if chunk.len() <= need {
+                                            buf.extend_from_slice(&chunk);
+                                        } else {
+                                            buf.extend_from_slice(&chunk[..need]);
+                                            break;
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        stream_err = Some(anyhow::anyhow!(e));
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            if let Some(e) = stream_err {
+                                let msg = e.to_string();
+                                let recoverable = msg.contains("error decoding response body")
+                                    || msg.contains("unexpected EOF")
+                                    || msg.contains("connection closed")
+                                    || msg.contains("incomplete message")
+                                    || msg.contains("error reading a body from connection");
+                                if !recoverable || attempts >= max_attempts {
+                                    return Err(e);
+                                }
+                                warn!(url = %url, attempt = attempts, error = %e, "reading response body stream failed");
+                                tokio::time::sleep(Duration::from_millis(200 * attempts)).await;
+                                continue;
+                            }
+                            return Ok(buf.freeze());
+                        }
+                        Err(err) => {
+                            warn!(url = %url, attempt = attempts, error = %err, "HTTP status error");
+                            if attempts >= max_attempts {
+                                return Err(err.into());
+                            }
+                            tokio::time::sleep(Duration::from_millis(200 * attempts)).await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(url = %url, attempt = attempts, error = %err, "sending download request failed");
+                    if attempts >= max_attempts {
+                        return Err(err.into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(200 * attempts)).await;
+                }
+            }
+        }
     }
 
     pub async fn remove_file(&self, file_id: &str, trash: bool) -> Result<()> {

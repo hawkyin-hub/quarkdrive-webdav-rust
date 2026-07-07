@@ -17,6 +17,7 @@ jobs:
       # We don't run `cargo fmt` because it would touch src/webdav.rs, src/proxy.rs,
       # src/mount.rs -- protected surfaces per .github/CODEOWNERS.
       - run: echo "fmt skipped (see comment)" && cargo fmt --all -- --check || true
+        working-directory: quarkdrive-webdav
 
   lint:
     runs-on: macos-14
@@ -28,6 +29,7 @@ jobs:
       # Note: not using `-D warnings` because the codebase has 25 inherited warnings;
       # cleaning them all would require touching src/* which is a protected surface.
       - run: cargo clippy --all-targets --message-format=short
+        working-directory: quarkdrive-webdav
 
   build:
     runs-on: macos-14
@@ -35,6 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release -p quarkdrive-webdav
+        working-directory: quarkdrive-webdav
 
   test:
     runs-on: macos-14
@@ -42,6 +45,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --release -p quarkdrive-webdav
+        working-directory: quarkdrive-webdav
 
   package:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

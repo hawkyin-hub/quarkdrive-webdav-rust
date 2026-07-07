@@ -54,11 +54,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build .app bundle
-        run: bash scripts/build-app.sh
-      - name: Upload release asset
+      - name: Stage release binaries
+        run: |
+          mkdir -p release-artifacts
+          # The Rust binary built by the `build` job; copy it out for upload.
+          cp quarkdrive-webdav/target/release/quarkdrive-webdav release-artifacts/
+          # Generate a sha256 alongside the binary so users can verify integrity.
+          shasum -a 256 release-artifacts/quarkdrive-webdav > release-artifacts/quarkdrive-webdav.sha256
+          ls -la release-artifacts/
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: |
-            dist/*.app
-            quarkdrive-webdav/target/release/quarkdrive-webdav
+            release-artifacts/quarkdrive-webdav
+            release-artifacts/quarkdrive-webdav.sha256
+          body: |
+            ## What you get
+            A statically-linked `quarkdrive-webdav` binary built on `macos-14`
+            (aarch64-apple-darwin). Run it directly:
+
+            ```bash
+            chmod +x quarkdrive-webdav
+            ./quarkdrive-webdav --serve-only --host 127.0.0.1 --port 8443 --quark-cookie "<your cookie>"
+            ```
+
+            ## `.app` bundle
+            This release ships the **standalone binary** rather than the `.app`
+            bundle, because the `.app` packager (`scripts/build-app.sh`) depends
+            on the legacy Python Helper bundle, which is not part of this
+            repository. To produce the `.app` locally, follow
+            [docs/install.md](docs/install.md) — `bash scripts/build-app.sh`
+            on your machine after `cargo build --release`.
+
+            See [CHANGELOG.md](../CHANGELOG.md) for what changed.

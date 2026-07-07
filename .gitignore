@@ -40,3 +40,6 @@ _pending/
 
 # Internal debug snapshots
 .workbuddy/
+
+# Serena IDE config
+.serena/

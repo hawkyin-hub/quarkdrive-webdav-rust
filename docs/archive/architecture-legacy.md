@@ -2,7 +2,7 @@
 
 > 本文档描述 QuarkDrive-WebDAV 的系统架构、模块职责和数据流。
 > 版本：2026-07-05 | 状态：活跃开发中
-> 仓库根：`/Users/HawkSept/myproject/myapp/localquark-rust`
+> 仓库根：本仓库根目录
 
 ---
 

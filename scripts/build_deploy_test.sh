@@ -6,7 +6,7 @@
 # previously-installed daemon if it was started as root.
 set -euo pipefail
 
-ROOT="/Users/HawkSept/myproject/myapp/localquark-rust"
+ROOT="${LOCALQUARK_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CRATE="$ROOT/quarkdrive-webdav"
 APP_SRC="$ROOT/dist/LocalQuark-rust.app"
 APP_DST="/Applications/LocalQuark-rust.app"
@@ -24,13 +24,20 @@ step 2 "Build .app bundle"
 cd "$ROOT"
 ./scripts/build-app.sh 2>&1 | tail -10
 
-step 3 "Kill old server + unmount"
-killall -9 quarkdrive-webdav run-localquark.sh 2>/dev/null || true
-sleep 2
-osascript -e 'tell application "Finder" to close (every window whose name is "LocalQuark" or POSIX path of (target of it as alias) starts with "/Volumes/LocalQuark")' 2>/dev/null || true
+step 3 "Unmount gracefully, then kill server"
+# IMPORTANT: unmount BEFORE killall so webdavfs_agent can tear down
+# its vnode cache cleanly. Killing the server first leaves webdavfs_agent
+# in a half-dead state: it 0-byte ghost entries in vnode cache, Finder
+# sees the file as "already exists" on next drag-drop, and auto-renames
+# the user's file to "(1)" even when Quark has no such file.
 diskutil unmount force /Volumes/LocalQuark 2>/dev/null || true
+diskutil unmount force "${HOME}/Mount/Quark" 2>/dev/null || true
 diskutil unmount force /Volumes/127.0.0.1 2>/dev/null || true
 diskutil unmount force /Volumes/Quark 2>/dev/null || true
+sleep 3   # let webdavfs_agent release vnodes before we kill anything
+osascript -e 'tell application "Finder" to close (every window whose POSIX path of (target of it as alias) starts with "/Volumes/LocalQuark")' 2>/dev/null || true
+killall -9 webdavfs_agent 2>/dev/null || true   # belt-and-suspenders if any stuck
+killall -9 quarkdrive-webdav run-localquark.sh 2>/dev/null || true
 sleep 1
 
 step 4 "Install to /Applications (sudo)"

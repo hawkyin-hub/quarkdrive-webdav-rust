@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build /Users/HawkSept/Documents/localquark-rust/dist/LocalQuark-rust.app
-# from the in-tree sources. Idempotent -- safe to re-run after edits.
+# Build dist/LocalQuark-rust.app from the in-tree sources.
+# Idempotent -- safe to re-run after edits.
 #
 # Layout it produces:
 #   dist/LocalQuark-rust.app/Contents/

@@ -1,0 +1,8 @@
+# Default owners
+*       @hawkyin-hub
+
+# Sensitive surfaces require explicit maintainer review
+/quarkdrive-webdav/src/webdav.rs   @hawkyin-hub
+/quarkdrive-webdav/src/proxy.rs    @hawkyin-hub
+/quarkdrive-webdav/src/mount.rs    @hawkyin-hub
+/scripts/                          @hawkyin-hub

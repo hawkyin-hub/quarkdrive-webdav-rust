@@ -45,7 +45,7 @@ rtk pip list            rtk pnpm install        rtk npm run <script>
 
 # LocalQuark-Rust 项目指引
 
-> 仓库：`/Users/HawkSept/myproject/myapp/localquark-rust`
+> 仓库：本仓库根目录
 > 单 crate Rust 应用 + macOS 单 `.app` 打包。
 > 最后更新：2026-07-05
 

@@ -31,3 +31,12 @@ legacy/dist-legacy/
 # Backups
 *.bak
 *.bak2
+
+# Scratch / debug scripts (timestamp-named dev leftovers)
+_pending/
+
+# Audit / debug backups from earlier sessions
+.audit-backup-*/
+
+# Internal debug snapshots
+.workbuddy/

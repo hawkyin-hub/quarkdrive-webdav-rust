@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-ROOT="/Users/HawkSept/myproject/myapp/localquark-rust"
+ROOT="${LOCALQUARK_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 COOKIE_SRC="$ROOT/legacy/LocalQuark-python-bundle/LocalQuark/quark_cookie/cookies.json"
 COOKIE_DST="$HOME/Library/Application Support/LocalQuark/cookies.json"
 APP="/Applications/LocalQuark-rust.app"

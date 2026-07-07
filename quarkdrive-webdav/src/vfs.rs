@@ -1988,7 +1988,7 @@ impl DavFile for QuarkDavFile {
             // queued while we waited, our upload is obsolete — skip the
             // network round-trip and just clean up the local temp file.
             if let Some(current_gen) = self.fs.upload_generation.get(&full_path_for_gen) {
-                if *current_gen > self.upload_state.generation {
+                if *current_gen > self.upload_state.generation && self.upload_state.size < 1_024_000 {
                     debug!(
                         generation = self.upload_state.generation,
                         current_generation = *current_gen,

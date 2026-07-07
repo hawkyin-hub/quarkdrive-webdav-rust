@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, BodyStream};
 use hyper::body::Incoming;
 use hyper::header::HeaderValue;
 use hyper::server::conn::http1;
@@ -231,7 +231,7 @@ async fn handle_request(
     let m = method.as_str(); match m {
         "LOCK" => {
             info!(path = %path, "LOCK -> 200 (mocked)");
-            return Ok(lock_response());
+            return Ok(lock_response(&path));
         }
         "UNLOCK" => {
             info!(path = %path, "UNLOCK -> 204 (mocked)");
@@ -285,7 +285,13 @@ fn check_auth(req: &Request<Incoming>, cfg: &ProxyConfig) -> bool {
     u_clean == cfg.auth_user && p_clean == cfg.auth_password
 }
 
-fn lock_response() -> Response<BoxBody> {
+fn lock_response(path: &str) -> Response<BoxBody> {
+    let escaped_path = path
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
     let token = format!("urn:uuid:{}", uuid_v4_like());
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
@@ -297,9 +303,12 @@ fn lock_response() -> Response<BoxBody> {
                <D:depth>infinity</D:depth>\
                <D:timeout>Second-3600</D:timeout>\
                <D:locktoken><D:href>{token}</D:href></D:locktoken>\
+               <D:lockroot><D:href>{path}</D:href></D:lockroot>\
              </D:activelock>\
            </D:lockdiscovery>\
-         </D:prop>"
+         </D:prop>",
+        token = token,
+        path = escaped_path
     );
     let mut resp = Response::new(text_body(body));
     *resp.status_mut() = StatusCode::OK;
@@ -309,7 +318,7 @@ fn lock_response() -> Response<BoxBody> {
     );
     resp.headers_mut().insert(
         "Lock-Token",
-        HeaderValue::from_str(&token).unwrap(),
+        HeaderValue::from_str(&format!("<{}>", token)).unwrap(),
     );
     resp.headers_mut().insert(
         "Connection",
@@ -382,13 +391,16 @@ async fn proxy_to_backend(
         })
         .collect();
 
-    // 读取 body
-    let body_bytes = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes().to_vec(),
-        Err(e) => {
-            return Err(anyhow::anyhow!("read request body error: {}", e));
-        }
-    };
+    // 判断是否有 body
+    let content_length = req.headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let has_body = content_length > 0 || req.headers()
+        .get(hyper::header::TRANSFER_ENCODING)
+        .is_some();
 
     // 用 reqwest 转发(reqwest 0.12 已经支持所有 method + raw body)
     //
@@ -427,10 +439,24 @@ async fn proxy_to_backend(
         fwd = fwd.header(k, v);
     }
 
-    let res = if body_bytes.is_empty() {
-        fwd.send().await
+    let res = if has_body {
+        use futures_util::StreamExt;
+        let stream = BodyStream::new(req.into_body())
+            .filter_map(|res| async move {
+                match res {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            Some(Ok::<_, std::io::Error>(data))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => Some(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+                }
+            });
+        fwd.body(reqwest::Body::wrap_stream(stream)).send().await
     } else {
-        fwd.body(body_bytes).send().await
+        fwd.send().await
     };
 
     let resp = match res {

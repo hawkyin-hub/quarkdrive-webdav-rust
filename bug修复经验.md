@@ -7,6 +7,7 @@
 |------|------|-----------|-----------|---------|
 | 1 | 2026-07-05 | 大文件下载不匀速，忽快忽慢 | 精确范围缓存导致高频小请求，无对齐 & 并发重复下载 | dd 测试 + 拖放视频文件验证，4MB chunk 缓存成功落盘 |
 | 7 | 2026-07-07 | 本地构建/GitHub发布报错找不到Helper | 打包脚本路径强耦合被 git 忽略的 legacy 构建缓存目录 | 干净环境 swift build 成功，build_deploy_test.sh 及 restart_app.sh 跑通挂载 |
+| 8 | 2026-07-08 | 拖放文件时 Finder 报 Error -43 并上传失败 | Mock LOCK 响应头与 XML 不符规范，且代理层全内存收集及 VFS Write Folding 并发冲突 | 部署后拖放小文件与大文件均无报错，大小显示正确，上传正常 |
 
 ## 详细记录
 
@@ -504,3 +505,36 @@ $ curl PROPFIND target
 - ``scripts/build-app.sh`` (修改依赖资源提取路径)
 - ``scripts/restart_app.sh`` (修改 Cookie 源路径)
 - ``.gitignore`` (追加 `helper/.build/` 忽略)
+
+## Bug #8: 拖放文件时 Finder 报 Error -43 并上传失败
+
+**日期**: 2026-07-08
+**触发场景**: 用户往 `/Volumes/LocalQuark` 拖放任何文件（小文件或大文件）时，Finder 弹窗报错：`The operation can’t be completed because one or more required items can’t be found. (Error code -43)` 并直接中止上传。
+
+### 现象
+- 拖放任何大文件（甚至小文件），代理只收到一次 `PROPFIND /<filename>`，后端直接返回 `404 Not Found` 响应。之后 Finder **直接报错 -43，没有发起任何 PUT 或 LOCK 写入尝试**。
+- 用 `osascript` 模拟 Finder 拖放复制 `README.md` 时，虽不弹窗，但最终在挂载盘下生成的 `README.md` 是 **0B** 的空节点，且日志中并未产生 `PUT /README.md` 请求。
+- 在大文件上传日志中，发现存在多次 `PUT` 且都只用了 1ms 即返回 201 Created，但云端没有任何文件。
+
+### 根因分析
+1. **Mock LOCK 协议缺陷**：`webdavfs_agent` 在拖放开始时会先发起 `LOCK` 试图锁住目标文件。Rust 代理层的 Mock `LOCK` 响应存在两个严重缺陷：其一是 HTTP 响应头 `Lock-Token` 的值没有用 `<>` 括号包裹（违背 WebDAV RFC 规范）；其二是 XML 响应体中缺失了 `<D:lockroot>` 节点以说明锁定资源路径。这使 `webdavfs_agent` 内部发生状态矛盾并中止后续操作，报错 -43。
+2. **全内存 Request Body 缓冲延迟**：`proxy.rs` 对非 GET 请求（如 `PUT`）在转发时，采用全内存 `collect`。若文件较大，将产生极高延迟，导致 Finder 认为连接超时并重新发起 `PUT` 请求。
+3. **Write Folding 过于激进**：VFS 里的 Write Folding 机制是为了防止并发冗余写入。但在大文件重试时，后一次的 `open` 会增加 generation 计数器，导致前一次正在辛苦写入的 `PUT` 在 `flush` 时被判定为过期，静默丢弃（删除本地临时文件，并直接返回 201 Created 给 Finder），导致最终云端完全没有文件。
+
+### 修复
+1. **完善 Mock LOCK 响应**：在 `proxy.rs` 中，对 Mock `LOCK` 响应头 `Lock-Token` 的值加上 `<>` 括号。同时在其 XML body 中补充 `<D:lockroot><D:href>{escaped_path}</D:href></D:lockroot>` 节点（路径经过 XML转义），完全对齐遗留 Python 实现。
+2. **请求体流式转发**：引入 `http_body_util::BodyStream`。在 `proxy.rs` 的 `proxy_to_backend` 方法中，根据 `Content-Length` 或 `Transfer-Encoding` 判断请求体。若有 body，用 `wrap_stream` 包装成流式 `reqwest::Body` 转发，实现零内存缓冲，大幅降低上传延迟。
+3. **优化 Write Folding 阈值**：在 `vfs.rs` 里的 Write Folding 折叠检查中增加 `self.upload_state.size < 1_024_000` (1MB) 大小限制，仅对 0 字节探测 PUT 进行折叠，保障已开始传输的带 body 写入任务不被中途丢弃。
+
+### 改动结果 (端到端验证)
+1. **编译通过**：在 `quarkdrive-webdav/` 目录下 `cargo build` 顺利通过，无冲突。
+2. **文件大小正确，上传成功**：在 Finder 中进行文件拖放测试，无论小文件还是大文件均可毫无阻碍地完成上传。且运行 `ls -la /Volumes/LocalQuark` 能够查看到正确的 `README.md` 大小（5.2KB），不再显示为 0B。
+
+### 经验
+1. **macOS Finder 极度挑剔协议**：`webdavfs_agent` 对 LOCK/PROPFIND 等标准的 WebDAV 请求头部格式（如 `<>` 括号）和 XML 节点完整度有着极其严苛的要求，不合规的响应虽能在底层连通，但在 OS 层面会产生灾难性熔断。
+2. **零缓冲流式传输**：大文件代理转发中必须始终贯彻“零内存缓冲流式转发”原则，任何全内存 collect 都会因延迟引发上游的重试超时。
+3. **折叠逻辑需配合防护门槛**：为去重而设计的 folding 折叠机制必须区分 0 字节探测与实际传输数据包，一旦实际传输达到一定阈值（如 1MB），应绝对保障其传输完成。
+
+### 受影响文件
+- ``quarkdrive-webdav/src/proxy.rs`` (更新 mock LOCK 响应体与 Header，改为流式请求体转发)
+- ``quarkdrive-webdav/src/vfs.rs`` (Write Folding 增加 size < 1MB 阈值检查)

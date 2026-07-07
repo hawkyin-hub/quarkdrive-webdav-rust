@@ -33,14 +33,14 @@ REPO_ROOT="$(cd .. && pwd)"
 
 WEBDAV_BIN="${WEBDAV_BIN:-$REPO_ROOT/quarkdrive-webdav/target/release/quarkdrive-webdav}"
 if [ -z "${HELPER_BIN:-}" ]; then
-    if [ -f "$REPO_ROOT/legacy/LocalQuark-python-bundle/LocalQuark/helper/.build/arm64-apple-macosx/release/LocalQuarkHelper" ]; then
-        HELPER_BIN="$REPO_ROOT/legacy/LocalQuark-python-bundle/LocalQuark/helper/.build/arm64-apple-macosx/release/LocalQuarkHelper"
+    if [ -f "$REPO_ROOT/helper/.build/arm64-apple-macosx/release/LocalQuarkHelper" ]; then
+        HELPER_BIN="$REPO_ROOT/helper/.build/arm64-apple-macosx/release/LocalQuarkHelper"
     else
-        HELPER_BIN="$REPO_ROOT/legacy/LocalQuark-python-bundle/LocalQuark/helper/.build/release/LocalQuarkHelper"
+        HELPER_BIN="$REPO_ROOT/helper/.build/release/LocalQuarkHelper"
     fi
 fi
-HELPER_PLIST_SRC="${HELPER_PLIST_SRC:-$REPO_ROOT/legacy/LocalQuark-python-bundle/LocalQuark/helper/Resources/com.localquark.webdav-helper.plist}"
-SCRIPTS_SRC="${SCRIPTS_SRC:-$REPO_ROOT/legacy/LocalQuark-python-bundle/LocalQuark/bin}"
+HELPER_PLIST_SRC="${HELPER_PLIST_SRC:-$REPO_ROOT/helper/Resources/com.localquark.webdav-helper.plist}"
+SCRIPTS_SRC="${SCRIPTS_SRC:-$REPO_ROOT/scripts/bin}"
 OUT_APP="${OUT_APP:-$REPO_ROOT/dist/LocalQuark-rust.app}"
 
 # pre-flight

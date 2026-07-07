@@ -29,7 +29,7 @@
 set -euo pipefail
 
 ROOT="${LOCALQUARK_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-COOKIE_SRC="$ROOT/legacy/LocalQuark-python-bundle/LocalQuark/quark_cookie/cookies.json"
+COOKIE_SRC="$ROOT/scripts/bin/cookies.json"
 COOKIE_DST="$HOME/Library/Application Support/LocalQuark/cookies.json"
 APP="/Applications/LocalQuark-rust.app"
 LOG_WEBDAV="$HOME/Library/Logs/LocalQuark-rust-webdav.log"

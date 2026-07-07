@@ -6,6 +6,7 @@
 | 编号 | 日期 | 一句话症状 | 一句话根因 | 验证方式 |
 |------|------|-----------|-----------|---------|
 | 1 | 2026-07-05 | 大文件下载不匀速，忽快忽慢 | 精确范围缓存导致高频小请求，无对齐 & 并发重复下载 | dd 测试 + 拖放视频文件验证，4MB chunk 缓存成功落盘 |
+| 7 | 2026-07-07 | 本地构建/GitHub发布报错找不到Helper | 打包脚本路径强耦合被 git 忽略的 legacy 构建缓存目录 | 干净环境 swift build 成功，build_deploy_test.sh 及 restart_app.sh 跑通挂载 |
 
 ## 详细记录
 
@@ -459,3 +460,47 @@ $ curl PROPFIND target
 ### 受影响文件
 
 - ``quarkdrive-webdav/src/vfs.rs`` (`do_flush` 开头加 guard)
+
+## Bug #7: GitHub 发布/本地构建提示依赖 legacy Python bundle（核心 Swift Helper 与 bin 脚本未解耦）
+
+**日期**: 2026-07-07
+**触发场景**: 用户尝试发布到 GitHub，或他人本地 clone 仓库后直接执行构建 `./scripts/build-app.sh` 提示找不到 `LocalQuarkHelper` 二进制。
+
+### 故障表现
+
+- 用户尝试将代码发布到 GitHub，提示存在对未提交的 `legacy/` 目录中编译产物的隐性强依赖。
+- 干净环境下执行打包脚本时，因为 `.gitignore` 忽略了 Swift 的 `.build` 缓存目录，导致 `LocalQuarkHelper` 缺失，报错：`ERROR: missing .../LocalQuarkHelper`，无法完成本地打包构建。
+
+### 原因分析
+
+1. **构建脚本路径硬编码**：打包脚本 [build-app.sh](./scripts/build-app.sh) 默认硬编码从 `legacy/LocalQuark-python-bundle/LocalQuark/helper/.build/` 缓存目录中拉取编译好的 `LocalQuarkHelper` 辅助程序，以及从 `legacy/LocalQuark-python-bundle/LocalQuark/bin/` 拷贝 app 运行时的引导脚本。
+2. **Git 忽略了编译缓存**：`LocalQuarkHelper` 在 `legacy` 目录下的 `.build` 构建缓存目录被 `.gitignore` 忽略，未曾提交到代码库。
+3. **结果**：导致全新克隆仓库、或在 CI 服务（如 GitHub Actions）上执行构建的用户因缺少上述文件无法直接完成打包。
+
+### 修复
+
+1. **物理迁移资源**：将 Swift Helper 源码 `legacy/LocalQuark-python-bundle/LocalQuark/helper` 整体移动到项目根目录下的 [helper/](./helper)；将 8 个 app 运行时引导脚本从 `legacy/LocalQuark-python-bundle/LocalQuark/bin` 移动到项目根目录下的 [scripts/bin/](./scripts/bin/)；调试 Cookie 样本移动至 `scripts/bin/cookies.json`。
+2. **解耦路径依赖**：
+   - 更新 [build-app.sh](./scripts/build-app.sh) 里的 `HELPER_BIN`、`HELPER_PLIST_SRC` 和 `SCRIPTS_SRC` 变量，彻底摆脱 `legacy/` 路径，指向根目录的解耦目录。
+   - 更新 [restart_app.sh](./scripts/restart_app.sh) 的调试 Cookie 同步路径。
+   - 更新 [.gitignore](./.gitignore) 规则，忽略根目录下新 Swift 模块的编译缓存路径 `helper/.build/`。
+
+### 改动结果 (端到端验证)
+
+1. **独立编译通过**：
+   - 清理缓存并在根目录下重新编译：`cd helper && rm -rf .build && swift build -c release`。成功无错编译，生成特权 Swift Helper。
+2. **打包部署通过**：
+   - 运行 `./scripts/build_deploy_test.sh`：自动完成 Rust 与 Swift 二进制编译，成功打包为 `dist/LocalQuark-rust.app`，并在系统 `/Applications` 下部署和拉起服务，`/Volumes/LocalQuark` 成功挂载。
+3. **重启调试通过**：
+   - 运行 `./scripts/restart_app.sh`：成功自动提取 `scripts/bin/cookies.json` 作为最新 Cookie，完美拉起应用，挂载成功，且 WebDAV `PROPFIND` 测试返回 `1 entries at root`。
+
+### 教训
+
+1. **彻底解耦重构**：从旧技术栈迁移时，如果涉及系统辅助程序的构建和运行时脚本，必须将其与历史遗留包完全脱钩，全部提升为项目根目录级的原生模块。
+2. **不可隐式依赖忽略文件**：构建依赖链上严禁引用被 `.gitignore` 屏蔽的文件或本地特定的编译缓存（例如 Swift 的 `.build` 缓存目录），构建系统必须支持从干净的克隆环境中通过简单命令自行编译所有依赖组件。
+
+### 受影响文件
+
+- ``scripts/build-app.sh`` (修改依赖资源提取路径)
+- ``scripts/restart_app.sh`` (修改 Cookie 源路径)
+- ``.gitignore`` (追加 `helper/.build/` 忽略)

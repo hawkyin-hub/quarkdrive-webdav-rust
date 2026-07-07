@@ -21,6 +21,9 @@ codex.log
 qupla.txt
 Quark
 
+# Helper build cache
+helper/.build/
+
 # Legacy build cache
 legacy/LocalQuark-python-bundle/LocalQuark/helper/.build/
 legacy/LocalQuark-python-bundle/decoded/

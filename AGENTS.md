@@ -98,7 +98,7 @@ rtk cargo build --release
 
 > ⚠️ 上方历史注释已经过时。**Phase 1 实际已回滚为串行上传**，因为 Quark API
 > 元数据返回 `part_thread:1`，并发会触发 `PartNotSequential`。**Phase 2 / Phase 3 真实生效**。
-> 详细真实状态与可复现基准：[docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+> 详细真实状态与可复现基准：[docs/performance.md](docs/performance.md)
 - `quarkdrive-webdav/src/webdav.rs` — `dav-server` 协议适配层
 - `quarkdrive-webdav/src/mount.rs` — `mount_webdav -S -o url=...` 包装，macOS 版本差异敏感
 - `quarkdrive-webdav/src/proxy.rs` — HTTPS 终结代理，`mount_webdav` 强依赖
@@ -138,7 +138,7 @@ rtk cargo build --release
 
 ## 关键设计决策（不要随意推翻）
 
-1. **HTTPS 终结代理**：macOS 26.6 的 `webdavfs_agent` 拒绝 HTTP + Basic Auth（`Authentication method (Basic) too weak`），所以 daemon 内部架构必须是 `backend (HTTP 8080) → proxy (HTTPS 8443) → mount_webdav`。详见 `docs/DEPLOYMENT.md` 与 `ARCHITECTURE.md`。
+1. **HTTPS 终结代理**：macOS 26.6 的 `webdavfs_agent` 拒绝 HTTP + Basic Auth（`Authentication method (Basic) too weak`），所以 daemon 内部架构必须是 `backend (HTTP 8080) → proxy (HTTPS 8443) → mount_webdav`。详见 [`docs/deployment.md`](docs/deployment.md) 与 [`docs/archive/architecture-legacy.md`](docs/archive/architecture-legacy.md)。
 2. **挂载点默认值有两套**：CLI 二进制默认 `~/Mount/Quark`；`scripts/build-app.sh` 打包后默认 `/Volumes/LocalQuark`（`mount.rs` 会 `create_dir_all`，所以两者都生效）。
 3. **WebDAV 凭据**：`auth_user` 默认 `quasar`，`auth_password` 启动时随机生成并落盘 `~/Library/Application Support/QuarkDrive/webdav.passwd`（0o600）。CLI 示例用 `admin:admin` 是历史示例，不要复制到文档里。
 4. **Cookie 来源**：仅从 Chromium 系浏览器（Chrome / Brave / Edge / Arc / Chromium）抓取。不支持 Firefox。
@@ -151,20 +151,20 @@ rtk cargo build --release
 | 目录列表响应 | ~2s | ~200ms | Phase 2 删除多余 `sleep` |
 | 内存占用 (RSS) | ~50MB | ~37MB | Phase 3 移除 `flush()` |
 
-> 上表数字以 [docs/PERFORMANCE.md](docs/PERFORMANCE.md) 为准，"优化前"列只用于历史记录。
+> 上表数字以 [docs/performance.md](docs/performance.md) 为准，"优化前"列只用于历史记录。
 
 ## 文档索引
 
 | 文档 | 用途 |
 |------|------|
 | [README.md](README.md) | 项目介绍、快速开始 |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 模块职责、数据流图 |
+| [docs/archive/architecture-legacy.md](docs/archive/architecture-legacy.md) | 模块职责、数据流图（legacy 中文版；现行版见 [docs/architecture.md](docs/architecture.md)）|
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献流程、提交规范 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更 |
-| [docs/API.md](docs/API.md) | CLI / WebDAV / 环境变量参考 |
+| [docs/api.md](docs/api.md) | CLI / WebDAV / 环境变量参考 |
 | [docs/install.md](docs/install.md) | 安装步骤速览 |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | 单 `.app` 打包 + 部署 |
-| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | 性能基线 / 可复现测试 / Phase 真实状态 |
+| [docs/deployment.md](docs/deployment.md) | 单 `.app` 打包 + 部署 |
+| [docs/performance.md](docs/performance.md) | 性能基线 / 可复现测试 / Phase 真实状态 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 排错手册 |
 | [docs/archive/rust-migration.md](docs/archive/rust-migration.md) | 历史设计草案（仅参考） |
 

@@ -58,7 +58,7 @@ flowchart LR
 ### main.rs —— 启动编排器
 - **职责**：应用入口，负责初始化所有模块并协调生命周期
 - **关键逻辑**：
-  1. 解析 CLI（`clap` derive），默认值见 [README.md 参数表](README.md)
+  1. 解析 CLI（`clap` derive），默认值见 [README.md 参数表](../../README.md)
   2. 初始化 `tracing_subscriber` 日志（`RUST_LOG` 环境变量或 `--debug`）
   3. 构建 `CookieStore`（`--quark-cookie` 显式传则跳过浏览器抓取）
   4. 构建 `QuarkDriveFileSystem`（VFS 实例）
@@ -91,7 +91,7 @@ flowchart LR
   - ❌ Phase 1: `buffer_unordered(4)` 已回滚为串行（Quark API `part_thread:1` 不支持并发）
   - ✅ Phase 2: 移除多余的 `sleep` 延迟
   - ✅ Phase 3: 移除 `consume_buf` 的每写 `flush()`
-  > 详细原因与替代方案见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+  > 详细原因与替代方案见 [docs/performance.md](../performance.md)
 
 ### webdav.rs —— HTTP 请求处理
 - **职责**：基于 `dav-server` crate，处理 WebDAV HTTP 协议
@@ -246,7 +246,7 @@ sequenceDiagram
 - **现状**：`upload_chunk` / `do_flush` 中都是普通 `for chunk_idx in 1..=chunk_count` 循环，**不是**并发
 - **历史尝试**：早期版本用 `futures::stream::iter().buffer_unordered(4)`，5MB 上传从 ~30s 降到 ~8s
 - **回滚原因**：夸克网盘上传 API 元数据返回 `part_thread:1`，并发 chunk 触发 `PartNotSequential` 错误并返回 500
-- **改进空间**：待 Quark API 支持并发后再启用；详见 [docs/PERFORMANCE.md §4](docs/PERFORMANCE.md#4-已知性能陷阱不要重蹈覆辙)
+- **改进空间**：待 Quark API 支持并发后再启用；详见 [docs/performance.md §4](../performance.md#known-perf-pitfalls)
 
 ---
 
@@ -281,7 +281,7 @@ sequenceDiagram
 
 ## 附录：性能基准
 
-> 历史数字来自 Phase 1 并发版本（已回滚）。当前 Phase 2+3 实际生效的版本需要重新跑 [docs/PERFORMANCE.md §2](docs/PERFORMANCE.md#2-可复现的基准方法) 给出的命令填充 _TBD_。
+> 历史数字来自 Phase 1 并发版本（已回滚）。当前 Phase 2+3 实际生效的版本需要重新跑 [docs/performance.md §2](../performance.md#reproducible-benchmarks) 给出的命令填充 _TBD_。
 
 | 指标 | 优化前（历史） | 当前（_TBD_） | 备注 |
 |------|--------|--------|------|

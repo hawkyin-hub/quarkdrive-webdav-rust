@@ -183,17 +183,36 @@ async fn handle_request(
     let path = uri.path().to_string();
     info!(method = %method, uri = %uri, "PROXY request");
 
-    // 拦截 AppleDouble (._) 临时文件请求，直接在代理入口返回 404，
-    // 避免疯狂的系统级隐藏文件探测拖垮后端 VFS 及夸克 API 线程池。
+    // 拦截 AppleDouble (._) 临时文件请求：
+    // - PROPFIND/GET/HEAD 直接返回 404，避免疯狂探测拖垮后端
+    // - PUT 返回 201，DELETE 返回 204，假装成功但不传给云端，防止云端产生垃圾文件
     let decoded_path = percent_encoding::percent_decode_str(&path).decode_utf8_lossy();
     let last_segment = decoded_path.split('/').last().unwrap_or("");
     if last_segment.starts_with("._") {
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("Content-Length", "0")
-            .header("Connection", "close")
-            .body(empty_body())
-            .unwrap());
+        let m = method.as_str();
+        if m == "PROPFIND" || m == "GET" || m == "HEAD" {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Length", "0")
+                .header("Connection", "close")
+                .body(empty_body())
+                .unwrap());
+        } else if m == "PUT" {
+            let _ = req.into_body().collect().await;
+            return Ok(Response::builder()
+                .status(StatusCode::CREATED)
+                .header("Content-Length", "0")
+                .header("Connection", "close")
+                .body(empty_body())
+                .unwrap());
+        } else if m == "DELETE" {
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header("Content-Length", "0")
+                .header("Connection", "close")
+                .body(empty_body())
+                .unwrap());
+        }
     }
 
     // 拦截并读取 PROPFIND 代理层缓存

@@ -177,7 +177,7 @@ impl QuarkDrive {
             }
             Err(err) => {
                 let err_msg = res.text().await?;
-                debug!(error = %err_msg, url = %url, "request failed");
+                error!(error = %err_msg, url = %url, "request failed (body above)");
                 match err.status() {
                     Some(
                         _status_code
@@ -284,7 +284,7 @@ impl QuarkDrive {
             }
             Err(err) => {
                 let err_msg = res.text().await?;
-                debug!(error = %err_msg, url = %url, "request failed");
+                error!(error = %err_msg, url = %url, "request failed (body above)");
                 match err.status() {
                     Some(
                         _status_code
@@ -536,6 +536,8 @@ impl QuarkDrive {
         let req = MoveFileRequest {
             filelist: vec![file_id.to_string()],
             to_pdir_fid: to_parent_file_id.to_string(),
+            use_job_scheduler: false,
+            exclude_fids: vec![],
         };
         let res: CommonResponse = self
             .post_request(
@@ -578,7 +580,7 @@ impl QuarkDrive {
 
 
 
-    pub async fn create_folder(&self, parent_file_id: &str, name: &str) -> Result<()> {
+    pub async fn create_folder(&self, parent_file_id: &str, name: &str) -> Result<String> {
         debug!(parent_file_id = %parent_file_id, name = %name, "create folder");
         let req = CreateFolderRequest {
             pdir_fid: parent_file_id.to_string(),
@@ -597,7 +599,7 @@ impl QuarkDrive {
         if res.status != 200 {
             return Err(anyhow::anyhow!("create folder failed: {}", res.message));
         }
-        Ok(())
+        Ok(res.data.fid)
     }
 
 
@@ -892,7 +894,7 @@ impl QuarkDrive {
             }
             Err(err) => {
                 let err_msg = res.text().await?;
-                debug!(error = %err_msg, url = %url, "request failed");
+                error!(error = %err_msg, url = %url, "request failed (body above)");
                 match err.status() {
                     Some(
                         _status_code

@@ -11,8 +11,26 @@ pub struct Cache {
     inner: MokaCache<String, Vec<QuarkFile>>,
     drive: QuarkDrive,
     disk_root: PathBuf,
+    /// 磁盘缓存条目最大存活时间（秒）。超过此值的磁盘 JSON 视为失效，
+    /// 强制回源云端拉取，避免"已删除文件被永久缓存命中"的误报。
+    disk_ttl: u64,
 }
 const ONE_PAGE: u32 = 500;
+
+/// 磁盘缓存条目封装：记录写入时间戳，读取时按 disk_ttl 判定是否过期。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskCacheEntry {
+    ts: u64,
+    files: Vec<QuarkFile>,
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 impl Cache {
     pub fn new(max_capacity: u64, ttl: u64, drive: QuarkDrive) -> Self {
@@ -31,7 +49,9 @@ impl Cache {
             warn!(path = %disk_root.display(), error = %e,
                   "Cache::new: failed to create disk root, fallback to no-disk");
         }
-        Self { inner, drive, disk_root }
+        // 磁盘 TTL 与 moka TTL 对齐（默认 60s），保证一旦回源后重新落盘的
+        // 条目不会因为磁盘层无过期而"永久复活"。
+        Self { inner, drive, disk_root, disk_ttl: ttl }
     }
 
     fn disk_path(&self, key: &str) -> PathBuf {
@@ -48,8 +68,22 @@ impl Cache {
     async fn read_disk(&self, key: &str) -> Option<Vec<QuarkFile>> {
         let p = self.disk_path(key);
         match tokio::fs::read(&p).await {
-            Ok(bytes) => match serde_json::from_slice::<Vec<QuarkFile>>(&bytes) {
-                Ok(v) => Some(v),
+            Ok(bytes) => match serde_json::from_slice::<DiskCacheEntry>(&bytes) {
+                Ok(entry) => {
+                    let age_ms = now_ms().saturating_sub(entry.ts);
+                    if age_ms > self.disk_ttl * 1000 {
+                        // 磁盘条目已过期：视为失效，删除后回源云端。
+                        // 这是修复"已删除文件被永久缓存命中 → Finder 误报已存在"
+                        // 的关键：磁盘层原本永不过期，moka 淘汰后会重新 promote
+                        // 过期数据，形成死循环。
+                        debug!(path = %p.display(), key = %key, age_ms = age_ms,
+                               "disk cache: entry expired, treating as miss");
+                        let _ = tokio::fs::remove_file(&p).await;
+                        None
+                    } else {
+                        Some(entry.files)
+                    }
+                }
                 Err(e) => {
                     warn!(path = %p.display(), error = %e,
                           "disk cache: deserialize failed, ignoring");
@@ -64,8 +98,9 @@ impl Cache {
         let disk_root = self.disk_root.clone();
         let path = self.disk_path(&key);
         // 异步落盘：spawn 后立刻返回，不阻塞调用方。
+        let entry = DiskCacheEntry { ts: now_ms(), files: value };
         tokio::spawn(async move {
-            match serde_json::to_vec(&value) {
+            match serde_json::to_vec(&entry) {
                 Ok(bytes) => {
                     if let Err(e) = tokio::fs::write(&path, &bytes).await {
                         warn!(path = %path.display(), error = %e,
@@ -243,7 +278,14 @@ impl Cache {
             }
 
             self.insert(dfs_path.to_string(), current_files.clone()).await;
-            debug!("{} in cache", &dfs_path);
+            let names: Vec<String> = current_files.iter().take(8).map(|f| f.file_name.clone()).collect();
+            warn!(
+                dfs_path = %dfs_path,
+                target_path = %target_path,
+                count = current_files.len(),
+                sample = ?names,
+                "dfs: finished listing, inserted into cache"
+            );
             if dfs_path == target_path {
                 return;
             }
@@ -285,6 +327,19 @@ impl Cache {
         self.inner.insert(key, value).await;
     }
 
+    /// Read from moka + disk cache only (no cloud fetch). Used by create_dir
+    /// to read-modify-write a parent's listing after MKCOL so that nested
+    /// MKCOLs/PUTs can resolve the just-created directory immediately.
+    pub async fn get_cached(&self, key: &str) -> Option<Vec<QuarkFile>> {
+        self.get(key).await
+    }
+
+    /// Write to moka + disk cache only (no side effects). Used by create_dir
+    /// to insert a newly created folder into its parent's cached listing.
+    pub async fn insert_cache(&self, key: String, value: Vec<QuarkFile>) {
+        self.insert(key, value).await
+    }
+
     pub async fn invalidate(&self, path: &Path) {
         let key = path.to_string_lossy().into_owned();
         debug!(path = %path.display(), key = %key, "cache: invalidate");
@@ -301,6 +356,17 @@ impl Cache {
     pub fn invalidate_all(&self) {
         debug!("cache: invalidate all");
         self.inner.invalidate_all();
+        // 一并清空磁盘 propfind 缓存，避免 invalidate_all 后磁盘陈旧条目复活。
+        let disk_root = self.disk_root.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::fs::remove_dir_all(&disk_root).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %disk_root.display(), error = %e,
+                          "cache: invalidate_all disk clear failed");
+                }
+            }
+            let _ = tokio::fs::create_dir_all(&disk_root).await;
+        });
     }
 
     // ---------------- Chunk cache for large files ----------------

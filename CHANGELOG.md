@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-07-08
+
+### Fixed
+- Fixed bug causing file duplication on drag-and-drop overwrite uploads
+- Handled concurrency scenarios leading to PartNotSequential
+- Addressed missing target bugs in internal drag-and-drop operations
+
 ## [1.4.0] — 2026-07-07
 
 ### Fixed
@@ -76,7 +83,9 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ### Added
 - Initial release: WebDAV adapter for Quark Drive on macOS.
 
-[Unreleased]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/compare/v1.3.9...HEAD
+[Unreleased]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/compare/v1.3.9...v1.4.0
 [1.3.9]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/compare/v1.3.0...v1.3.9
 [1.3.0]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/compare/v1.0.0...v1.3.0
 [1.0.0]: https://github.com/hawkyin-hub/quarkdrive-webdav-rust/releases/tag/v1.0.0

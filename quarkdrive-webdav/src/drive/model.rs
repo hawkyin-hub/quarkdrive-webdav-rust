@@ -104,6 +104,8 @@ pub struct RenameFileRequest {
 pub struct MoveFileRequest {
     pub filelist: Vec<String>,
     pub to_pdir_fid: String,
+    pub use_job_scheduler: bool,
+    pub exclude_fids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]

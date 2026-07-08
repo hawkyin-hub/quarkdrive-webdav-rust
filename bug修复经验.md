@@ -8,6 +8,7 @@
 | 1 | 2026-07-05 | 大文件下载不匀速，忽快忽慢 | 精确范围缓存导致高频小请求，无对齐 & 并发重复下载 | dd 测试 + 拖放视频文件验证，4MB chunk 缓存成功落盘 |
 | 7 | 2026-07-07 | 本地构建/GitHub发布报错找不到Helper | 打包脚本路径强耦合被 git 忽略的 legacy 构建缓存目录 | 干净环境 swift build 成功，build_deploy_test.sh 及 restart_app.sh 跑通挂载 |
 | 8 | 2026-07-08 | 拖放文件时 Finder 报 Error -43 并上传失败 | Mock LOCK 响应头与 XML 不符规范，且代理层全内存收集及 VFS Write Folding 并发冲突 | 部署后拖放小文件与大文件均无报错，大小显示正确，上传正常 |
+| 14 | 2026-07-08 | 拖放文件时 macOS 弹"同名文件已存在"，但云端根本没有该文件 | 磁盘目录缓存 `propfind/*.json` 永不过期，已删除文件被永久缓存命中；`invalidate_all` 不清磁盘；0 字节 probe 占位失败时 45s 内残留 | Python 直连 8443：删除后立即 404 无复活；注入 120s 前陈旧条目被 TTL 拒绝回源云端 |
 
 ## 详细记录
 
@@ -538,3 +539,71 @@ $ curl PROPFIND target
 ### 受影响文件
 - ``quarkdrive-webdav/src/proxy.rs`` (更新 mock LOCK 响应体与 Header，改为流式请求体转发)
 - ``quarkdrive-webdav/src/vfs.rs`` (Write Folding 增加 size < 1MB 阈值检查)
+
+---
+
+## 2026-07-08: 缓存与实际情况不一致 → macOS 误报"同名文件已存在"
+
+### 故障表现
+- 用户拖放 `领先的密码_BLM方法论.pdf` 到 LocalQuark（RamDisk → 挂载盘），macOS 弹出
+  **"The operation can't be completed because an item with the name '领先的密码_BLM方法论.pdf' already exists."**
+- 云端（夸克网盘）实际**不存在**该文件。
+- 此前用户已多次遇到类似"明明没这个文件又提示我"的误报。
+
+### 根因分析（缓存机制全面审计）
+项目共有 **4 层重叠缓存**，相互交互出错：
+
+| 缓存 | 位置 | TTL | 问题 |
+|------|------|-----|------|
+| `dir_cache` moka | cache.rs | **60s** | 正常 |
+| `dir_cache` 磁盘 JSON | `~/Library/Caches/LocalQuark/propfind/<hash>.json` | **无（永久）** | 🔴 主因 |
+| `proxy::PROPFIND_CACHE` | proxy.rs | 5s | 仅代理层，受上游影响 |
+| `active_writes` | vfs.rs DashMap | 45s | 🔴 probe 占位残留 |
+
+- **主因（BUG1）**：`read_disk()` 读取磁盘 JSON **不检查时间戳**，`get()` 命中后还把过期数据
+  re-promote 回 moka（重置 60s 计时）。导致"已删除文件"的目录列表被**永久**缓存命中并不断复活，
+  形成死循环。实测磁盘目录下有 **301 个陈旧 json**，其中 `66bd1539c0af4747.json` 仍含
+  `领先的密码_BLM方法论.pdf`（parent_path=`/应用程序`，云端已无该文件）——正是用户误报的直接来源。
+- **次因（BUG3）**：`invalidate_all()` 只清 moka，**不清磁盘**，全量失效后磁盘陈旧条目仍会复活。
+- **次因（BUG4）**：0 字节 probe 在 `do_flush` 注册 size=0 的 `active_writes` 占位；若后续真实内容
+  上传失败，该占位 45s 内残留 → macOS 在窗口内误以为文件存在。
+
+### 改动
+1. **`cache.rs` — 磁盘缓存加 TTL（修复 BUG1）**：
+   - 新增 `DiskCacheEntry { ts: u64, files: Vec<QuarkFile> }` 落盘格式，`write_disk` 写入当前毫秒时间戳。
+   - `read_disk` 读取时计算 `age_ms = now - ts`，**超过 `disk_ttl*1000`（60s）直接删文件并返回 None**，
+     强制回源云端。
+   - `Cache` 结构体新增 `disk_ttl` 字段（= moka ttl = 60s）。`get()` 不再把过期磁盘数据 promote 回 moka。
+2. **`cache.rs` — `invalidate_all` 清磁盘（修复 BUG3）**：改为同时 `remove_dir_all(disk_root)` 并重建目录，
+   全量失效时磁盘陈旧条目一并清除。
+3. **`vfs.rs do_flush` — probe 占位失败清理（修复 BUG4）**：真实内容上传路径（size>0）起点先
+   `remove_active_write(pp, name)` 清掉 0 字节 probe 占位；成功时 `after_flush()` 用真实 size 重新注册，
+   失败时保持移除 → 消除 45s 误报窗口。
+
+### 验证
+- 清理：删除全部 301 个陈旧磁盘缓存文件。
+- 部署：mtime **14:52:56**（cargo build --release + build_deploy_test.sh 重装重启，`/Volumes/LocalQuark` 已挂载）。
+- Python 直连 8443（`/tmp/verify_cache_ttl.py`）：
+  1. 上传 → PROPFIND **207**（存在）✅
+  2. DELETE → **204**
+  3. 立即 PROPFIND → **404**（已删除期望）✅，且反复 5 次均 404，**无磁盘复活** ✅
+- Python 注入陈旧条目（`/tmp/verify_disk_ttl_stale.py`）：
+  1. 手动注入 `ts=120s前` 的陈旧磁盘条目 + 幽灵文件
+  2. PROPFIND 幽灵文件 → **404**（TTL 拒绝 + 回源云端确认不存在）✅
+
+### 经验
+1. **WebDAV 缓存必须"写时失效 + 读时过期校验"双保险**：磁盘持久化缓存**绝不能永不过期**，否则外部删除
+   （手机 App / 网页端 / 其他挂载实例）的文件会被本挂载永久误报存在。
+2. **moka TTL 不等于安全**：若磁盘层无过期，moka 淘汰后回源磁盘仍会拿到陈旧数据并重新 promote，
+   等于"永不过期"。两层 TTL 必须对齐。
+3. **probe 占位符必须有失败清理路径**：0 字节探针为避免误删真实文件而跳过上传，但其注册的
+   `active_writes` 占位若不在上传失败路径清理，会在窗口内反向造成"已存在"误报。
+4. **诊断技巧**：缓存类误报第一现场在 `~/Library/Caches/LocalQuark/propfind/*.json`——直接 grep 文件名
+   即可定位是否磁盘陈旧命中。
+
+### 受影响文件
+- ``quarkdrive-webdav/src/cache.rs``（`DiskCacheEntry` 新格式、`read_disk`/`write_disk` TTL、`invalidate_all` 清磁盘、`disk_ttl` 字段）
+- ``quarkdrive-webdav/src/vfs.rs``（`do_flush` 真实上传起点 `remove_active_write`）
+
+> ⚠️ 待用户确认：请重新拖放 `领先的密码_BLM方法论.pdf`（或任意"云端实际没有"的文件）到 LocalQuark，
+> 确认不再弹"同名文件已存在"。

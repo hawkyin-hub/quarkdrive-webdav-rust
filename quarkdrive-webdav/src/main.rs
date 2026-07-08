@@ -94,6 +94,14 @@ struct Opt {
     #[arg(long, default_value = "true")]
     warm_root: bool,
 
+    /// 写入/上传非0字节文件时的 do_flush 最长等待时间（秒）。如果超过该时间，会提前返回成功，由后台异步线程继续上传。
+    #[arg(long, default_value = "5")]
+    upload_wait_timeout: u64,
+
+    /// 缓存预读分块大小（字节）。较小的值（例如 1MB）可有效防范在慢速网络中因为下载耗时过长导致 Finder 强行超时断开。
+    #[arg(long, default_value = "1048576")]
+    read_ahead_chunk_size: u64,
+
     #[command(subcommand)]
     subcommands: Option<Commands>,
 }
@@ -322,6 +330,8 @@ async fn main() -> Result<()> {
     let drive = QuarkDrive::new(drive_config)?;
     let mut fs = QuarkDriveFileSystem::new(drive, "/".to_string(), 1000u64, 600u64)?;
     fs.set_read_only(false).set_no_trash(false);
+    fs.set_upload_wait_timeout(opt.upload_wait_timeout);
+    fs.set_read_ahead_chunk_size(opt.read_ahead_chunk_size);
     let fs_for_webdav = fs.clone();
 
     // 4. TLS

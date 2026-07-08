@@ -119,6 +119,11 @@ impl WebDavServer {
                                 let auth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).cloned();
                                 let ua = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).cloned();
                                 let depth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("depth")).cloned();
+                                // E2E DEBUG: dump every request header so we can see exactly
+                                // what Finder sends (Destination/Overwrite/Lock-Token/If/...).
+                                for (k, v) in req.headers() {
+                                    info!(header = %k, value = %v.to_str().unwrap_or("<binary>"), "INCOMING HEADER");
+                                }
                                 info!(
                                     method = %method,
                                     uri = %uri,
@@ -131,7 +136,12 @@ impl WebDavServer {
                                 async move {
                                     let resp = fut.await;
                                     match &resp {
-                                        Ok(r) => info!(status = %r.status(), "RESPONSE"),
+                                        Ok(r) => {
+                                            info!(status = %r.status(), "RESPONSE");
+                                            for (k, v) in r.headers() {
+                                                info!(resp_header = %k, value = %v.to_str().unwrap_or("<binary>"), "RESPONSE HEADER");
+                                            }
+                                        }
                                         Err(e) => error!(error = %e, "RESPONSE ERROR"),
                                     }
                                     resp
@@ -154,13 +164,21 @@ impl WebDavServer {
                     let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let method = req.method().clone();
                         let uri = req.uri().clone();
+                        for (k, v) in req.headers() {
+                            info!(header = %k, value = %v.to_str().unwrap_or("<binary>"), "INCOMING HEADER (http)");
+                        }
                         info!(method = %method, uri = %uri, "INCOMING REQUEST (http)");
                         let fut = svc.call(req);
                         async move {
                             let resp = fut.await;
                             match &resp {
-                                Ok(r) => info!(status = %r.status(), "RESPONSE"),
-                                Err(e) => error!(error = %e, "RESPONSE ERROR"),
+                                Ok(r) => {
+                                    info!(status = %r.status(), "RESPONSE (http)");
+                                    for (k, v) in r.headers() {
+                                        info!(resp_header = %k, value = %v.to_str().unwrap_or("<binary>"), "RESPONSE HEADER (http)");
+                                    }
+                                }
+                                Err(e) => error!(error = %e, "RESPONSE ERROR (http)"),
                             }
                             resp
                         }

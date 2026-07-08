@@ -57,6 +57,8 @@ pub struct QuarkDriveFileSystem {
     skip_upload_same_size: bool,
     prefer_http_download: bool,
     upload_wait_timeout: u64,
+    pub(crate) read_ahead_chunk_size: u64,
+    pub(crate) pending_renames: Arc<DashMap<String, (String, String)>>,
     /// Filesystem-wide monotonic counter for unique temp-file names.
     /// Pinned in atomic so concurrent calls to `prepare_for_upload` produce
     /// strictly distinct paths even when the wall-clock ms collides
@@ -82,6 +84,35 @@ impl QuarkDriveFileSystem {
     /// P2-1: invalidate the proxy's PROPFIND cache for `dav_path` and its
     /// descendants. Call this after any write that changes a directory listing
     /// (upload/delete/rename/mkdir) so the proxy doesn't serve stale listings.
+    /// Look up a file in ``active_writes`` by parent path + file name.
+    /// Returns ``Some(QuarkFile)`` if an in-flight upload / probe placeholder
+    /// exists for that location, or ``None`` otherwise.
+    pub(crate) fn active_writes_get(
+        &self,
+        parent_str: &str,
+        file_name_str: &str,
+        parent_fid: &str,
+    ) -> Option<QuarkFile> {
+        let key = format!("{}/{}", parent_str.trim_end_matches('/'), file_name_str);
+        self.active_writes.get(&key).map(|entry| {
+            QuarkFile {
+                fid: String::new(),
+                file_name: file_name_str.to_string(),
+                pdir_fid: parent_fid.to_string(),
+                size: entry.size,
+                format_type: "application/octet-stream".to_string(),
+                status: 1,
+                dir: false,
+                file: true,
+                content_hash: None,
+                created_at: 0u64,
+                updated_at: entry.updated_at,
+                download_url: None,
+                parent_path: Some(parent_str.to_string()),
+            }
+        })
+    }
+
     pub fn invalidate_proxy_propfind(&self, dav_path: &std::path::Path) {
         crate::proxy::invalidate_propfind(&dav_path.to_string_lossy());
     }
@@ -163,6 +194,8 @@ impl QuarkDriveFileSystem {
             skip_upload_same_size: false,
             prefer_http_download: false,
             upload_wait_timeout: 280,
+            read_ahead_chunk_size: 4 * 1024 * 1024,
+            pending_renames: Arc::new(DashMap::new()),
             temp_seq: Arc::new(AtomicU64::new(0)),
             write_locks: Arc::new(DashMap::new()),
             upload_generation: Arc::new(DashMap::new()),
@@ -229,6 +262,11 @@ impl QuarkDriveFileSystem {
 
     pub fn set_upload_wait_timeout(&mut self, upload_wait_timeout: u64) -> &mut Self {
         self.upload_wait_timeout = upload_wait_timeout;
+        self
+    }
+
+    pub fn set_read_ahead_chunk_size(&mut self, read_ahead_chunk_size: u64) -> &mut Self {
+        self.read_ahead_chunk_size = read_ahead_chunk_size;
         self
     }
     fn list_uploading_files(&self, parent_file_path: &str) -> Vec<QuarkFile> {
@@ -663,13 +701,49 @@ impl DavFileSystem for QuarkDriveFileSystem {
             if let Some(name) = path.file_name() {
                 self.dir_cache.invalidate(parent_path).await;
                 let name = name.to_string_lossy().into_owned();
-                self.drive
+                // P2-5: create_folder now returns the new folder's fid so we can
+                // register it in the parent's dir_cache immediately. Without this,
+                // a nested MKCOL (Finder drag-drop of a folder with subdirectories)
+                // fails with 409 because get_file(parent) can't find the just-
+                // created directory — the cloud listing cache was invalidated by
+                // the first MKCOL but hasn't been re-fetched yet, and the disk
+                // cache may still be stale. By inserting the new dir into the
+                // parent's cache here, child MKCOLs and PUTs resolve immediately.
+                let new_fid = self.drive
                     .create_folder(&parent_file.fid, &name)
                     .await
                     .map_err(|err| {
                         error!(path = %path.display(), error = %err, "create folder failed");
                         FsError::GeneralFailure
                     })?;
+                // Insert new directory into parent's cache entry so nested ops see it
+                if !new_fid.is_empty() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let new_dir_file = QuarkFile {
+                        fid: new_fid.clone(),
+                        file_name: name.clone(),
+                        pdir_fid: parent_file.fid.clone(),
+                        size: 0,
+                        format_type: String::new(),
+                        status: 1,
+                        dir: true,
+                        file: false,
+                        content_hash: None,
+                        created_at: now,
+                        updated_at: now,
+                        download_url: None,
+                        parent_path: Some(parent_path.to_string_lossy().into_owned()),
+                    };
+                    let parent_str = parent_path.to_string_lossy().into_owned();
+                    if let Some(mut files) = self.dir_cache.get_cached(&parent_str).await {
+                        files.push(new_dir_file);
+                        self.dir_cache.insert_cache(parent_str, files).await;
+                        debug!(fid = %new_fid, name = %name, "create_dir: inserted new folder into parent cache");
+                    }
+                }
                 self.dir_cache.invalidate(&path).await;
                 self.dir_cache.invalidate_parent(&path).await;
                 // P2-1: drop proxy PROPFIND cache so the new folder is visible.
@@ -726,33 +800,49 @@ impl DavFileSystem for QuarkDriveFileSystem {
                 return Err(FsError::Forbidden);
             }
 
-            let file = self
-                .get_file(path.clone())
-                .await?
-                .ok_or(FsError::NotFound)?;
-            if !file.file {
-                return Err(FsError::Forbidden);
+            let parent_str = path.parent().and_then(|p| p.to_str()).unwrap_or("/");
+            let file_name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Try cloud cache first
+            if let Ok(Some(file)) = self.get_file(path.clone()).await {
+                if !file.file {
+                    return Err(FsError::Forbidden);
+                }
+                self.drive
+                    .remove_file(&file.fid, !self.no_trash)
+                    .await
+                    .map_err(|err| {
+                        error!(path = %path.display(), error = %err, "remove file failed");
+                        FsError::GeneralFailure
+                    })?;
+                self.dir_cache.invalidate_parent(&path).await;
+                self.remove_active_write(parent_str, file_name_str);
+                self.remove_uploading_file(parent_str, file_name_str);
+                self.invalidate_proxy_propfind(&path);
+                if let Some(p) = path.parent() {
+                    self.invalidate_proxy_propfind(p);
+                }
+                return Ok(());
             }
-            self.drive
-                .remove_file(&file.fid, !self.no_trash)
-                .await
-                .map_err(|err| {
-                    error!(path = %path.display(), error = %err, "remove file failed");
-                    FsError::GeneralFailure
-                })?;
-            self.dir_cache.invalidate_parent(&path).await;
-            // Bug fix: 同时清理 active_writes，避免删除后 45s 内 PROPFIND 仍返回该文件，
-            // 导致拖放同名新文件时误弹"是否替换"对话框。
-            self.remove_active_write(
-                path.parent().and_then(|p| p.to_str()).unwrap_or("/"),
-                path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-            );
-            // P2-1: drop proxy PROPFIND cache so the deleted file disappears.
-            self.invalidate_proxy_propfind(&path);
-            if let Some(p) = path.parent() {
-                self.invalidate_proxy_propfind(p);
+
+            // Not in cloud — check active_writes (0-byte probe placeholder or
+            // in-flight upload).  Finder replace sequence:
+            //   PROPFIND->207(sees placeholder) -> DELETE -> PUT(new content).
+            // Without this branch DELETE returns 404 for placeholders (not on
+            // Quark yet), Finder reports "an item with the name '' already exists".
+            let aw_key = format!("{}/{}", parent_str.trim_end_matches('/'), file_name_str);
+            if self.active_writes.get(&aw_key).is_some() {
+                debug!(path = %path.display(), "remove_file: deleting active_writes placeholder");
+                self.remove_active_write(parent_str, file_name_str);
+                self.remove_uploading_file(parent_str, file_name_str);
+                self.invalidate_proxy_propfind(&path);
+                if let Some(p) = path.parent() {
+                    self.invalidate_proxy_propfind(p);
+                }
+                return Ok(()); // 204 No Content
             }
-            Ok(())
+
+            Err(FsError::NotFound)
         }
             .boxed()
     }
@@ -775,54 +865,145 @@ impl DavFileSystem for QuarkDriveFileSystem {
 
             let is_dir;
             if from.parent() == to.parent() {
-                // rename
+                // rename (same directory)
                 if let Some(name) = to.file_name() {
-                    let file = self
+                    let mut file = self
                         .get_file(from.clone())
                         .await?
+                        // P4-1: file may exist only as active_writes placeholder.
+                        // Intra-mount drag of such a file must not return NotFound
+                        // (404 → macOS Error -43).
+                        .or_else(|| {
+                            let from_name = from.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let from_parent = from.parent()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            self.active_writes_get(&from_parent, &from_name, "")
+                        })
                         .ok_or(FsError::NotFound)?;
                     is_dir = file.dir;
                     let name = name.to_string_lossy().into_owned();
-                    self.drive
-                        .rename_file(&file.fid, &name)
-                        .await
-                        .map_err(|err| {
-                            error!(from = %from.display(), to = %to.display(), error = %err, "rename file failed");
-                            FsError::GeneralFailure
-                        })?;
-                    self.dir_cache.invalidate_parent(&from).await;
+                    // P4-2: if fid is empty (active_writes placeholder), skip Quark
+                    // rename_file("") which would fail.  Simulate at aw level.
+                    if file.fid.is_empty() {
+                        let from_name = from.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let parent_str = from.parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        // Remove old key, register new name under same parent.
+                        self.remove_active_write(&parent_str, &from_name);
+                        self.register_active_write(
+                            parent_str.as_str(),
+                            &name,
+                            file.size,
+                            "",
+                        ).await;
+                        self.invalidate_proxy_propfind(&from);
+                        self.invalidate_proxy_propfind(&to);
+                    } else {
+                        let to_parent_str = to.parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.pending_renames.insert(file.fid.clone(), (to_parent_str, name.clone()));
+
+                        let _ = self.drive
+                            .rename_file(&file.fid, &name)
+                            .await;
+                        self.dir_cache.invalidate_parent(&from).await;
+                    }
                 } else {
                     return Err(FsError::Forbidden);
                 }
             } else {
-                // move
-                let file = self
+                // move (cross-directory)
+                let mut file = self
                     .get_file(from.clone())
                     .await?
+                    // P4-1: same active_writes fallback for cross-directory MOVE.
+                    .or_else(|| {
+                        let from_name = from.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let from_parent = from.parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.active_writes_get(&from_parent, &from_name, "")
+                    })
                     .ok_or(FsError::NotFound)?;
+                // empty-fid guard: right after an upload commit, the cloud
+                // listing may briefly expose the file with an empty fid.
+                // move_file("") → Quark 400 / silent no-op (file stays put,
+                // Finder reports "拖动到子目录失败"). Retry resolving the
+                // real fid from a fresh parent listing. (see bug修复经验.md #9)
+                if file.fid.is_empty() {
+                    // P4-2: retry cloud listing first (eventual consistency).
+                    let mut found_in_cloud = false;
+                    for _attempt in 0..3 {
+                        self.dir_cache.invalidate_parent(&from).await;
+                        if let Some(f) = self.get_file(from.clone()).await? {
+                            if !f.fid.is_empty() {
+                                file = f;
+                                found_in_cloud = true;
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    }
+                    if !found_in_cloud {
+                        // File only exists as active_writes placeholder (no cloud
+                        // fid).  Simulate the move at aw level so Finder doesn't
+                        // get Error -43.
+                        let from_name = from.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let from_parent_str = from.parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let to_name = to.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let to_parent_str = to.parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.remove_active_write(&from_parent_str, &from_name);
+                        self.register_active_write(
+                            to_parent_str.as_str(),
+                            &to_name,
+                            file.size,
+                            "",
+                        ).await;
+                        self.invalidate_proxy_propfind(&from);
+                        self.invalidate_proxy_propfind(&to);
+                        self.dir_cache.invalidate_parent(&from).await;
+                        self.dir_cache.invalidate_parent(&to).await;
+                        return Ok(()); // 201/204 — Finder sees success
+                    }
+                }
                 is_dir = file.dir;
                 let to_parent_file = self
                     .get_file(to.parent().unwrap().to_path_buf())
                     .await?
                     .ok_or(FsError::NotFound)?;
                 let new_name = to_dav.file_name();
-                self.drive
-                    .move_file(&file.fid, &to_parent_file.fid)
-                    // then rename ...
-                    .await
-                    .map_err(|err| {
-                        error!(from = %from.display(), to = %to.display(), error = %err, "move file failed");
-                        FsError::GeneralFailure
-                    })?;
-                if let Some(to_name) = new_name {
-                    if let Some(from_name) = from_dav.file_name(){
-                        if from_name != to_name {
-                            self.drive.rename_file(&file.fid, to_name)
-                                .await
-                                .map_err(|err| {
-                                    error!(from = %from.display(), to = %to.display(), error = %err, "rename file after move failed");
-                                    FsError::GeneralFailure
-                                })?;
+
+                let to_name = new_name
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                let to_parent_str = to.parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.pending_renames.insert(file.fid.clone(), (to_parent_str, to_name));
+
+                if let Ok(_) = self.drive.move_file(&file.fid, &to_parent_file.fid).await {
+                    if let Some(to_name) = new_name {
+                        if let Some(from_name) = from_dav.file_name(){
+                            if from_name != to_name {
+                                let _ = self.drive.rename_file(&file.fid, to_name).await;
+                            }
                         }
                     }
                 }
@@ -984,6 +1165,7 @@ impl QuarkDavFile {
                 .and_modify(|g| *g += 1)
                 .or_insert(1);
             self.upload_state.generation = *upload_gen;
+            debug!(file_name = %self.file.file_name, generation = *upload_gen, "PREPARE_FOR_UPLOAD generation");
             // Combine wall-clock ms with a filesystem-wide atomic counter so
             // two concurrent PUTs that arrive in the same millisecond cannot
             // produce the same temp path. AtomicU64::fetch_add is the only
@@ -1003,6 +1185,35 @@ impl QuarkDavFile {
 
     async fn do_flush(&mut self) -> Result<(), FsError> {
         let size = self.upload_state.size;
+        // P2-3: Resolve the real old file when open() treated this PUT as a
+        // brand-new create (self.file.fid empty) because the cloud listing
+        // hadn't caught up to a *previous* upload at this exact path yet
+        // (eventual-consistency window right after an upload/overwrite).
+        // Without this, the FIRST overwrite of a just-uploaded file would be
+        // treated as a fresh create, producing a DUPLICATE same-name file on
+        // Quark -> name conflict -> Finder Error -36 ("can't be read or
+        // written"). The first attempt fails; later attempts succeed once the
+        // cloud listing is consistent. Fix: if a recent active_writes entry
+        // exists for this path (a file was just written here) and no fid was
+        // resolved, force a fresh parent listing from the cloud to find the
+        // real existing same-name file and adopt its fid (overwrite semantics).
+        if size > 0 && self.file.fid.is_empty() {
+            let aw_key = self.parent_dir.join(&self.file.file_name).to_string_lossy().to_string();
+            if self.fs.active_writes.get(&aw_key).is_some() {
+                self.fs.dir_cache.invalidate(self.parent_dir.as_path()).await;
+                if let Some(files) = self.fs.dir_cache.get_or_insert(&self.parent_path_str()).await {
+                    for f in &files {
+                        if f.file_name == self.file.file_name && !f.fid.is_empty() {
+                            info!(file_name = %self.file.file_name, resolved_fid = %f.fid,
+                                  "P2-3: resolved existing same-name file as old_fid (overwrite)");
+                            self.file.fid = f.fid.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // P2-2: capture the old fid BEFORE up_pre overwrites self.file.fid with
         // the new fid. The old file is deleted only after the new upload fully
         // succeeds, so a mid-upload failure can no longer lose the old file.
@@ -1012,26 +1223,49 @@ impl QuarkDavFile {
             None
         };
 
-        // BUG #6 fix: skip up_pre for "create new + size=0" PUTs.
-        // macOS webdavfs_agent probes a target vnode with a 0-byte PUT
-        // before the actual body PUT lands. With the previous behavior,
-        // do_flush() fell through to up_pre → commit → finish and created
-        // a permanent 0-byte file on Quark. Then the next PUT (real
-        // 1.4MB body) saw "/target exists" via Finder Keep Both and got
-        // auto-renamed to "(1)", leaving the user with two files: a
-        // 0-byte original + a 1.4MB "(1)".
-        // See bug修复经验.md #6.
-        // Trade-off: a user who actually drags a real 0-byte file
-        // (blank.txt) will not see it persisted to Quark. This is rare
-        // compared to the drag-drop regression; if needed later, the
-        // server can be taught via a separate code path.
-        if size == 0 && old_fid.is_none() {
-            debug!(file_name = %self.file.file_name,
-                   "do_flush: 0-byte brand-new PUT — skip up_pre (webdavfs_agent vnode probe)");
+        debug!(file_name = %self.file.file_name, size = size, fid = %self.file.fid, old_fid_present = old_fid.is_some(), generation = self.upload_state.generation, is_finished = self.upload_state.is_finished, is_uploading = self.upload_state.is_uploading, "DO_FLUSH ENTRY");
+
+        // BUG #6 fix (extended for overwrite): skip up_pre for ALL 0-byte PUTs,
+        // whether brand-new or overwrite. macOS webdavfs_agent probes a target
+        // vnode with a 0-byte PUT before the actual body PUT lands.
+        // - For a brand-new file: skipping avoids creating a permanent 0-byte
+        //   file and the later "(1)" duplicate (see bug修复经验.md #6).
+        // - For an OVERWRITE: the previous code (size==0 && old_fid.is_none())
+        //   fell through and ran up_pre as a 0-byte 秒传, which DELETED the real
+        //   file and created a 0-byte placeholder — destructive and wrong. Now
+        //   any 0-byte PUT just registers a placeholder active_write (size=0)
+        //   and lets the real content PUT do the actual overwrite.
+        // Trade-off: a user who actually drags a real 0-byte file will not see
+        // it persisted to Quark. This is rare compared to the drag-drop
+        // regression; if needed later, the server can be taught via a separate
+        // code path.
+        if size == 0 {
+            debug!(file_name = %self.file.file_name, fid = %self.file.fid, size = size,
+                   "do_flush: 0-byte PUT (probe) — SKIP up_pre (webdavfs_agent vnode probe)");
             self.upload_state.is_finished = true;
-            self.after_flush().await?;
+            // CRITICAL FIX for Error -36 (Finder drag-drop):
+            // macOS webdavfs_agent sends: empty-probe PUT (CL:0) → LOCK → PROPFIND
+            // (verify file exists) → real-content PUT.
+            // The old code called after_flush() which REMOVED the uploading entry
+            // and never registered an active_writes overlay entry, so the
+            // verification PROPFIND hit all 3 lookup sources (cache, active_writes,
+            // uploading) empty and returned 404 → Finder aborts with Error -36.
+            // Fix: register a placeholder active_write (size=0) so the file is
+            // visible via PROPFIND during the probe→content window. The real content
+            // PUT will overwrite this entry with the correct size after upload.
+            let pp = self.parent_path_str();
+            self.fs.register_active_write(&pp, &self.file.file_name, 0u64, "").await;
             return Ok(());
         }
+
+        // BUG4 fix: 0-byte probe 在上面注册了 size=0 的 active_writes 占位符，
+        // 让 macOS 的验证 PROPFIND 能看到"文件已存在"（probe 阶段需要）。
+        // 现在进入真实内容上传，先清掉这个占位符：
+        // - 上传成功时 after_flush() 会用真实 size 重新注册（可见性不丢失）；
+        // - 上传失败时它保持移除，避免 45s 内 macOS 一直以为文件"已存在"，
+        //   从而误报"同名文件已存在"（即使云端根本没有这个文件）。
+        let probe_pp = self.parent_path_str();
+        self.fs.remove_active_write(&probe_pp, &self.file.file_name);
 
         // Compute final SHA-1 and MD5 (all data has been written)
         let sha1 = format!("{:x}", self.sha1_ctx.clone().finalize());
@@ -1057,9 +1291,18 @@ impl QuarkDavFile {
                            "failed to get cloud file md5, proceeding with upload");
                 }
             }
-            if self.fs.skip_upload_same_size && self.file.size == size {
+            // P2-4: Only skip on "same size" for a genuinely brand-new file
+            // (old_fid is None). For an OVERWRITE (old_fid present) we must
+            // always re-upload: the user may be replacing with different
+            // content of the same size, and self.file.size comes from the
+            // cloud/active_writes placeholder which can be stale right after a
+            // prior upload (eventual-consistency window). Skipping here would
+            // leave the OLD content in place -> the first overwrite "succeeds"
+            // but is corrupt (Finder Error -36 / wrong file). The md5-skip
+            // above still short-circuits truly identical-content re-drops.
+            if old_fid.is_none() && self.fs.skip_upload_same_size && self.file.size == size {
                 debug!(file_name = %self.file.file_name, size = size,
-                       "skip uploading: same size");
+                       "skip uploading: same size (brand-new file)");
                 self.upload_state.is_finished = true;
                 self.after_flush().await?;
                 return Ok(());
@@ -1309,19 +1552,61 @@ impl QuarkDavFile {
                 }
             }
 
-            fs.register_active_write(&parent_path, &file_name, upload_state.size, &temp_path).await;
+            // === 核心：检测上传期间发生的重命名或移动 ===
+            let mut latest_parent_path = parent_path.clone();
+            let mut latest_file_name = file_name.clone();
+            let mut latest_parent_dir = parent_dir.clone();
+
+            if let Some((_, (new_parent_path_str, new_name))) = fs.pending_renames.remove(&new_fid) {
+                debug!(file_name = %file_name, new_name = %new_name, new_parent = %new_parent_path_str,
+                       "upload finished: applying pending rename/move mutation");
+                
+                // 1. 如果父目录变了，发起云端移动
+                let new_parent_path = PathBuf::from(&new_parent_path_str);
+                if new_parent_path_str != parent_path {
+                    if let Ok(Some(to_parent_file)) = fs.get_file(new_parent_path.clone()).await {
+                        if let Err(e) = drive_inner.move_file(&new_fid, &to_parent_file.fid).await {
+                            error!(file_name = %file_name, error = %e, "pending move: move_file failed");
+                        }
+                    }
+                }
+                
+                // 2. 如果文件名变了，发起云端改名
+                if new_name != file_name {
+                    if let Err(e) = drive_inner.rename_file(&new_fid, &new_name).await {
+                        error!(file_name = %file_name, error = %e, "pending rename: rename_file failed");
+                    }
+                }
+
+                latest_parent_path = new_parent_path_str.clone();
+                latest_file_name = new_name.clone();
+                latest_parent_dir = new_parent_path;
+            }
+
+            fs.register_active_write(&latest_parent_path, &latest_file_name, upload_state.size, &temp_path).await;
+            
             // cleanup
             if tokio::fs::metadata(&temp_path).await.is_ok() {
                 let _ = tokio::fs::remove_file(&temp_path).await;
             }
+            
+            // 双重清理 uploading，防范未然
             fs.remove_uploading_file(&parent_path, &file_name);
-            let full_path = parent_dir.join(&file_name);
+            fs.remove_uploading_file(&latest_parent_path, &latest_file_name);
+
+            let full_path = latest_parent_dir.join(&latest_file_name);
             fs.dir_cache.invalidate(full_path.as_path()).await;
             fs.dir_cache.invalidate_chunks(&full_path.to_string_lossy());
+            fs.dir_cache.invalidate(latest_parent_dir.as_path()).await;
+            
+            // 清理旧路径的缓存
+            let old_full_path = parent_dir.join(&file_name);
+            fs.dir_cache.invalidate(old_full_path.as_path()).await;
             fs.dir_cache.invalidate(parent_dir.as_path()).await;
-            // P2-1: drop proxy PROPFIND cache so the new/overwritten file is
-            // visible immediately (otherwise stale for up to 5s).
+
             fs.invalidate_proxy_propfind(parent_dir.as_path());
+            fs.invalidate_proxy_propfind(old_full_path.as_path());
+            fs.invalidate_proxy_propfind(latest_parent_dir.as_path());
             fs.invalidate_proxy_propfind(full_path.as_path());
 
             Ok::<(), FsError>(())
@@ -1492,6 +1777,7 @@ impl QuarkDavFile {
         let bytes = self.upload_state.buffer.split().freeze().to_vec();
         // 写入临时文件
         self.upload_state.size = self.upload_state.size + bytes.len() as u64;
+        debug!(file_name = %self.file.file_name, added = bytes.len(), new_size = self.upload_state.size, "CONSUME_BUF");
         if let Some(parent) = std::path::Path::new(&temp_path).parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 error!("create_dir_all failed: {}, path: {:?}", e, parent);
@@ -1807,19 +2093,19 @@ impl DavFile for QuarkDavFile {
                 .to_string_lossy()
                 .to_string();
 
-            const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4MB
-            let start_chunk_idx = read_start / CHUNK_SIZE;
-            let end_chunk_idx = (read_end - 1) / CHUNK_SIZE;
+            let chunk_size = self.fs.read_ahead_chunk_size;
+            let start_chunk_idx = read_start / chunk_size;
+            let end_chunk_idx = (read_end - 1) / chunk_size;
 
             let mut result_buf = vec![0u8; (read_end - read_start) as usize];
             const CHUNK_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
             for chunk_idx in start_chunk_idx..=end_chunk_idx {
-                let chunk_align_start = chunk_idx * CHUNK_SIZE;
-                let chunk_len = if chunk_align_start + CHUNK_SIZE > file_size {
+                let chunk_align_start = chunk_idx * chunk_size;
+                let chunk_len = if chunk_align_start + chunk_size > file_size {
                     file_size - chunk_align_start
                 } else {
-                    CHUNK_SIZE
+                    chunk_size
                 } as usize;
                 let chunk_align_end = chunk_align_start + chunk_len as u64;
 

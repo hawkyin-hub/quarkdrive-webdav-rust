@@ -39,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 pub struct ActiveWriteInfo {
     pub file_name: String,
     pub size: u64,
+    pub fid: String,
     pub updated_at: u64,
     pub body: Vec<u8>,
     pub created_at: std::time::Instant,
@@ -117,14 +118,11 @@ impl QuarkDriveFileSystem {
         crate::proxy::invalidate_propfind(&dav_path.to_string_lossy());
     }
 
-    pub async fn register_active_write(&self, parent_path: &str, file_name: &str, size: u64, temp_file_path: &str) {
+    pub async fn register_active_write(&self, parent_path: &str, file_name: &str, size: u64, fid: &str, temp_file_path: &str) {
         // 清理超过 45 秒的过期记录
         self.active_writes.retain(|_, v| v.created_at.elapsed().as_secs() < 45);
 
-        if size > 16 * 1024 * 1024 {
-            return;
-        }
-        let body = if size == 0 {
+        let body = if size == 0 || size > 16 * 1024 * 1024 {
             Vec::new()
         } else {
             // Under concurrent same-path PUTs (write-coalescing), the previous
@@ -155,6 +153,7 @@ impl QuarkDriveFileSystem {
         let info = ActiveWriteInfo {
             file_name: file_name.to_string(),
             size,
+            fid: fid.to_string(),
             updated_at: utc_time,
             body,
             created_at: std::time::Instant::now(),
@@ -391,7 +390,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     if active_write.created_at.elapsed().as_secs() < 45 {
                         let now = active_write.updated_at * 1000;
                         file_opt = Some(QuarkFile {
-                            fid: "".to_string(),
+                            fid: active_write.fid.clone(),
                             file_name: active_write.file_name.clone(),
                             pdir_fid: parent_file.fid.clone(),
                             size: active_write.size,
@@ -518,7 +517,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                     if k_parent_norm == norm_path {
                         let now = info.updated_at * 1000;
                         active_files.push(QuarkFile {
-                            fid: "".to_string(),
+                            fid: info.fid.clone(),
                             file_name: info.file_name.clone(),
                             pdir_fid: "".to_string(),
                             size: info.size,
@@ -598,7 +597,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                         let parent_path = path.parent().ok_or(FsError::NotFound)?;
                         let now = active_write.updated_at * 1000;
                         file = Some(QuarkFile {
-                            fid: "".to_string(),
+                            fid: active_write.fid.clone(),
                             file_name: active_write.file_name.clone(),
                             pdir_fid: "".to_string(),
                             size: active_write.size,
@@ -901,6 +900,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                             &name,
                             file.size,
                             "",
+                            "",
                         ).await;
                         self.invalidate_proxy_propfind(&from);
                         self.invalidate_proxy_propfind(&to);
@@ -974,6 +974,7 @@ impl DavFileSystem for QuarkDriveFileSystem {
                             to_parent_str.as_str(),
                             &to_name,
                             file.size,
+                            file.fid.as_str(),
                             "",
                         ).await;
                         self.invalidate_proxy_propfind(&from);
@@ -1254,7 +1255,7 @@ impl QuarkDavFile {
             // visible via PROPFIND during the probe→content window. The real content
             // PUT will overwrite this entry with the correct size after upload.
             let pp = self.parent_path_str();
-            self.fs.register_active_write(&pp, &self.file.file_name, 0u64, "").await;
+            self.fs.register_active_write(&pp, &self.file.file_name, 0u64, "", "").await;
             return Ok(());
         }
 
@@ -1266,6 +1267,15 @@ impl QuarkDavFile {
         //   从而误报"同名文件已存在"（即使云端根本没有这个文件）。
         let probe_pp = self.parent_path_str();
         self.fs.remove_active_write(&probe_pp, &self.file.file_name);
+        
+        // Invalidate proxy cache here before the real upload (which may be backgrounded).
+        // This ensures that when the client's `PUT` returns and Finder subsequently
+        // issues a `PROPFIND /` to refresh the folder, it won't hit a stale proxy cache
+        // but will hit the backend and see the file from the `uploading_files` overlay.
+        self.fs.invalidate_proxy_propfind(self.parent_dir.as_path());
+        let full_path = self.parent_dir.join(&self.file.file_name);
+        self.fs.invalidate_proxy_propfind(full_path.as_path());
+
 
         // Compute final SHA-1 and MD5 (all data has been written)
         let sha1 = format!("{:x}", self.sha1_ctx.clone().finalize());
@@ -1335,7 +1345,7 @@ impl QuarkDavFile {
             }
             self.after_flush().await?;
             let pp = self.parent_path_str();
-            self.fs.register_active_write(&pp, &self.file.file_name, self.upload_state.size, &self.upload_state.temp_file_path).await;
+            self.fs.register_active_write(&pp, &self.file.file_name, self.upload_state.size, self.file.fid.as_str(), &self.upload_state.temp_file_path).await;
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -1383,7 +1393,7 @@ impl QuarkDavFile {
             }
             self.after_flush().await?;
             let pp = self.parent_path_str();
-            self.fs.register_active_write(&pp, &self.file.file_name, self.upload_state.size, &self.upload_state.temp_file_path).await;
+            self.fs.register_active_write(&pp, &self.file.file_name, self.upload_state.size, self.file.fid.as_str(), &self.upload_state.temp_file_path).await;
             return Ok(());
         }
         // Spawn upload task so it won't be cancelled if client disconnects.
@@ -1483,7 +1493,7 @@ impl QuarkDavFile {
                 etags.push(etag);
             }
             if early_finish {
-                fs.register_active_write(&parent_path, &file_name_inner, upload_state.size, &temp_path).await;
+                fs.register_active_write(&parent_path, &file_name_inner, upload_state.size, new_fid.as_str(), &temp_path).await;
                 if tokio::fs::metadata(&temp_path).await.is_ok() {
                     let _ = tokio::fs::remove_file(&temp_path).await;
                 }
@@ -1583,7 +1593,7 @@ impl QuarkDavFile {
                 latest_parent_dir = new_parent_path;
             }
 
-            fs.register_active_write(&latest_parent_path, &latest_file_name, upload_state.size, &temp_path).await;
+            fs.register_active_write(&latest_parent_path, &latest_file_name, upload_state.size, new_fid.as_str(), &temp_path).await;
             
             // cleanup
             if tokio::fs::metadata(&temp_path).await.is_ok() {
@@ -1695,7 +1705,7 @@ impl QuarkDavFile {
             self.upload_state.is_finished = true;
             self.after_flush().await?;
             let pp = self.parent_path_str();
-            self.fs.register_active_write(&pp, &self.file.file_name, self.upload_state.size, &self.upload_state.temp_file_path).await;
+            self.fs.register_active_write(&pp, &self.file.file_name, self.upload_state.size, self.file.fid.as_str(), &self.upload_state.temp_file_path).await;
             return Ok(());
         }
         self.upload_state.auth_info = res.data.auth_info;
@@ -2054,14 +2064,16 @@ impl DavFile for QuarkDavFile {
                 let path_str = full_path.to_string_lossy().to_string();
                 if let Some(info) = self.fs.active_writes.get(&path_str) {
                     if info.created_at.elapsed().as_secs() < 45 {
-                        let start = self.current_pos as usize;
-                        if start >= info.body.len() {
-                            return Ok(Bytes::new());
+                        if !info.body.is_empty() {
+                            let start = self.current_pos as usize;
+                            if start >= info.body.len() {
+                                return Ok(Bytes::new());
+                            }
+                            let end = std::cmp::min(start + count, info.body.len());
+                            let bytes = Bytes::copy_from_slice(&info.body[start..end]);
+                            self.current_pos = end as u64;
+                            return Ok(bytes);
                         }
-                        let end = std::cmp::min(start + count, info.body.len());
-                        let bytes = Bytes::copy_from_slice(&info.body[start..end]);
-                        self.current_pos = end as u64;
-                        return Ok(bytes);
                     }
                 }
 

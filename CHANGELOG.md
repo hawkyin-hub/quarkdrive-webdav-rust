@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-07-08
+
+### Fixed
+- Fixed Finder drag-and-drop Error -36 failures by mocking `PUT` and `DELETE` requests for macOS AppleDouble (`._`) hidden files.
+- Prevented cloud directory pollution by intercepting macOS metadata files at the proxy layer, returning `201 Created` without actually uploading the data to Quark API.
+
 ## [1.4.1] — 2026-07-08
 
 ### Fixed
